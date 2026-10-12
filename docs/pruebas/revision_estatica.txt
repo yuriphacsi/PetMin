@@ -1,0 +1,4 @@
+API 3 presente en Android y firmware; seis rutas cotejadas.
+Firmware sin simulacion ni HC-SR04. Cinco desafios; Gaming sin import del cliente IoT.
+19 metodos JUnit declarados, no ejecutados. No Secrets.h en entrega.
+Documentacion actual comprobada despues de corregir fechas futuras del ZIP recibido.

@@ -1,0 +1,1647 @@
+--- a/.gitignore
++++ b/.gitignore
+@@ -5,3 +5,6 @@
+ *.iml
+ *.jks
+ *.keystore
++
++firmware/**/Secrets.h
++.local/
+--- a/LEEME.md
++++ b/LEEME.md
+@@ -1,21 +1,34 @@
+-# PetMin 3.0 — Proyecto Android + ESP32 (base real, sin demo)
++# PetMin 3.0 — Android + ESP32 + Gaming 3D
+ 
+-Esta versión es una **actualización parcial comprobable en código** del proyecto recibido, no el producto completo.
++Código actualizado el 12/10/2026. **Compilación Android y firmware completo aún no verificados; no incluye APK.** Esta entrega no certifica funcionamiento con hardware.
+ 
+-## Cambios realizados
+-- Nombre público PetMin; versionName 3.0.0.
+-- Eliminado el interruptor de demostración y el mecanismo de alimentación simulada desde Android.
+-- Solo se envían órdenes a un ESP32 real y se rechaza firmware configurado en simulación.
+-- Historial real con retención configurable de 7 o 30 días (se limpia al iniciar, sincronizar y cambiar la preferencia).
+-- Se conservan nombres de paquetes, columnas heredadas y rutas de firmware para minimizar riesgos de migración.
+-- Se incluyen instrucciones para agente de programación y comentarios de extensión futura.
++## Empezar
++1. Abrir carpeta PetMin en Android Studio, JDK 17 y SDK 35.
++2. Con acceso a Internet: `gradlew.bat testDebugUnitTest assembleDebug` (Windows) o `bash gradlew testDebugUnitTest assembleDebug` (Linux).
++3. Instalar el APK que se genere en `app/build/outputs/apk/debug/app-debug.apk`. No existe dentro de este ZIP.
++4. Configurar/cargar firmware siguiendo `docs/CONFIGURAR_ESP32.md`, inicialmente con actuador deshabilitado.
++5. Android y ESP32 en la misma red; guardar IP y clave en Ajustes. Ambos deben utilizar API 3.
+ 
+-## Funciones aún pendientes
+-- PetMin Gaming 3D (modelo, selección perro/gato, desafíos y progreso).
+-- Cambio del diseño del circuito a SG90 + celda de carga de 10 kg pesando el depósito de 2 kg.
+-- Ajustes de firmware, API, calibración, horarios y seguridad para el montaje real.
+-- Validación de la compilación, pruebas Android y pruebas de dispensación física.
++## Implementado en código
++- Inicio, Porción, Horarios, Gaming, Historial y Ajustes.
++- Estado real, gramos/porcentaje de tolva de 2000 g, aviso de nivel bajo y buzzer.
++- Porciones manuales confirmadas, secuencias persistentes antirrepetición, paro y errores.
++- Pérdida de peso con HX711, estabilidad previa, filtrado, tolerancia y protecciones de tiempo/sensor/flujo.
++- Hasta 12 horarios diarios persistentes en ESP32, NTP/Lima, marcas contra duplicados y recuperación tras reinicios.
++- Historial Room y LittleFS paginado, retención 7/30 días, estados interrumpidos y comidas omitidas.
++- Perfiles editables: nombre, perro/gato, edad en meses, peso opcional, foto opcional y preferencias.
++- Mascota 3D original geométrica: perro/gato, habitación, giro limitado, reposo, alegría y alimentación virtual.
++- Cinco desafíos con puntuación persistente y totalmente separados del dispensador.
++- Comentarios en español, plan para cuatro integrantes y protocolo de pruebas.
+ 
+-**ADVERTENCIA:** El firmware recibido presupone MG996R, HC-SR04 y una balanza bajo el recipiente. No es compatible sin cambios con el circuito propuesto (SG90 + HX711 en el depósito). No accionar el mecanismo hasta adaptar y calibrar el firmware. No se ha generado ni probado un APK.
++## Pendiente o limitado
++- Compilar e instalar Android; compilar/cargar ESP32 y ejecutar pruebas reales de hardware, UI y OpenGL.
++- Validar precisión, torque SG90, atascos, pérdida de red, cortes eléctricos, flash y horarios con app cerrada.
++- Calibración y Wi-Fi del ESP32 por USB/archivos: no hay calibración remota ni aprovisionamiento Wi-Fi desde Android.
++- Aviso de nivel bajo en pantalla y buzzer; no hay notificaciones móviles con app cerrada.
++- Pérdida de peso de tolva estima salida; no confirma llegada al plato ni consumo. Para eso hace falta otra medición.
++- Futuro: escaneo/fotogrametría, accesorios, monedas, nube y más niveles/habitaciones.
+ 
+-Abre la carpeta `PetMin` en Android Studio. Consulta `AGENTE_PETMIN.md` antes de seguir.
++Se conserva paquete com.yuri.petbite y esquema Room 1 sin borrar datos. Campos heredados demo/lastDemoDay en Room solo conservan compatibilidad; no existe dispensación simulada. La copia original está en `respaldo/` del ZIP final. Sus informes antiguos no prueban esta revisión.
++
++Leer diagnóstico, plan, API, calibración, verificación y recursos en docs/.
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -2,6 +2,7 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+     <uses-permission android:name="android.permission.INTERNET" />
+     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
++    <uses-feature android:glEsVersion="0x00010000" android:required="true" />
+     <application android:allowBackup="false" android:label="PetMin"
+         android:icon="@drawable/ic_petbite" android:supportsRtl="true"
+         android:usesCleartextTraffic="true" android:theme="@style/Theme.PetBite">
+--- a/app/src/main/java/com/yuri/petbite/PetViewModel.kt
++++ b/app/src/main/java/com/yuri/petbite/PetViewModel.kt
+@@ -55,7 +55,7 @@
+     fun setRetentionDays(days: Int) {
+         if (days !in listOf(7, 30)) return
+         persist(settings.value.copy(retentionDays = days))
+-        viewModelScope.launch { cleanupHistory(); message("Historial configurado a $days días.") }
++        viewModelScope.launch { cleanupHistory(); refreshInternal(false); message("Retención local: $days días. El ESP32 se actualizará al conectar.") }
+     }
+     private fun persist(value: PetSettings) { store.save(value); _settings.value = value }
+     fun message(text: String) { viewModelScope.launch { messageChannel.send(text) } }
+@@ -83,6 +83,7 @@
+         val config = settings.value
+         try {
+             val current = api.status(config)
++            if (current.retentionDays != config.retentionDays && !current.busy) api.retention(config)
+             val imported = api.events(config)
+             if (settings.value == config) {
+                 _device.value = current
+@@ -123,11 +124,11 @@
+                 run {
+                     val current = api.status(config)
+                     _device.value = current
+-                    if (current.simulation) throw DeviceRejected("El ESP32 está en simulación. Desactiva HARDWARE_SIMULATION en Config.h.")
++                    if (current.simulation) throw DeviceRejected("El ESP32 está en simulación. Carga el firmware PetMin v3 incluido.")
+                     if (!current.ready) throw DeviceRejected(current.message.ifBlank { "El dispensador no está listo." })
+                 }
+                 dao.saveEvent(event.copy(demo = _device.value?.simulation == true))
+-                val delivered = api.dispense(config, event.id, grams)
++                val delivered = api.dispense(config, event.id, grams, requireNotNull(_device.value).nextSequence)
+                 dao.saveEvent(event.copy(deliveredGrams = delivered, status = "Completado", demo = _device.value?.simulation == true))
+                 message("Dispensación confirmada: $delivered g.")
+                 refreshInternal(false)
+--- a/app/src/main/java/com/yuri/petbite/data/Database.kt
++++ b/app/src/main/java/com/yuri/petbite/data/Database.kt
+@@ -30,7 +30,7 @@
+ interface PetDao {
+     @Query("SELECT * FROM schedules ORDER BY hour, minute")
+     fun schedules(): Flow<List<MealSchedule>>
+-    @Query("SELECT * FROM feed_events ORDER BY timestamp DESC LIMIT 500")
++    @Query("SELECT * FROM feed_events ORDER BY timestamp DESC")
+     fun events(): Flow<List<FeedEvent>>
+     @Insert(onConflict = OnConflictStrategy.REPLACE)
+     suspend fun saveSchedule(schedule: MealSchedule)
+--- /dev/null
++++ b/app/src/main/java/com/yuri/petbite/data/Profiles.kt
+@@ -0,0 +1,16 @@
++package com.yuri.petbite.data
++
++import android.content.Context
++import org.json.JSONArray
++import org.json.JSONObject
++
++// PETMIN NOTA: perfiles y juego usan almacenes distintos del historial Room.
++data class PetProfile(val id: String, val name: String, val species: String, val age: String, val weight: String, val food: String, val photo: String)
++class ProfileStore(context: Context) {
++    private val prefs = context.getSharedPreferences("petmin_profiles", Context.MODE_PRIVATE)
++    fun read(): List<PetProfile> = runCatching {
++        val a = JSONArray(prefs.getString("profiles", "[]"))
++        (0 until a.length()).map { val o = a.getJSONObject(it); PetProfile(o.getString("id"), o.getString("name"), o.getString("species"), o.optString("age"), o.optString("weight"), o.optString("food"), o.optString("photo")) }
++    }.getOrDefault(emptyList())
++    fun save(values: List<PetProfile>) { val a = JSONArray(); values.forEach { a.put(JSONObject().put("id",it.id).put("name",it.name).put("species",it.species).put("age",it.age).put("weight",it.weight).put("food",it.food).put("photo",it.photo)) }; prefs.edit().putString("profiles", a.toString()).apply() }
++}
+--- a/app/src/main/java/com/yuri/petbite/data/Settings.kt
++++ b/app/src/main/java/com/yuri/petbite/data/Settings.kt
+@@ -4,10 +4,8 @@
+ 
+ data class PetSettings(
+     val petName: String = "Mi mascota",
+-    val demo: Boolean = false,
+     val address: String = "http://192.168.1.100",
+     val token: String = "",
+-    val demoRemaining: Int = 1125,
+     val syncedSignature: String = "",
+     val retentionDays: Int = 30
+ )
+@@ -16,10 +14,8 @@
+     private val prefs = context.getSharedPreferences("petbite_settings", Context.MODE_PRIVATE)
+     fun read() = PetSettings(
+         petName = prefs.getString("petName", "Mi mascota")!!,
+-        demo = false,
+         address = prefs.getString("address", "http://192.168.1.100")!!,
+         token = prefs.getString("token", "")!!,
+-        demoRemaining = 0,
+         syncedSignature = prefs.getString("signature", "")!!,
+         retentionDays = prefs.getInt("retentionDays", 30).let { if (it == 7) 7 else 30 }
+     )
+--- a/app/src/main/java/com/yuri/petbite/device/FeederApi.kt
++++ b/app/src/main/java/com/yuri/petbite/device/FeederApi.kt
+@@ -11,11 +11,12 @@
+ import java.net.HttpURLConnection
+ import java.net.URL
+ 
+-// API v2: el firmware compatible está incluido en firmware/PetBiteESP32.
++// API v3: el firmware compatible está incluido en firmware/PetBiteESP32.
+ data class DeviceStatus(
+     val levelPercent: Int?, val lastGrams: Double?, val checkedAt: Long,
+     val ready: Boolean, val busy: Boolean, val clockSynced: Boolean,
+-    val deviceId: String, val message: String, val simulation: Boolean
++    val deviceId: String, val message: String, val simulation: Boolean,
++    val remainingGrams: Double? = null, val nextSequence: Long = 1, val retentionDays: Int = 30
+ )
+ class DeviceRejected(message: String) : Exception(message)
+ class FeederApi(private val pollDelayMs: Long = 700, private val maxPolls: Int = 60) {
+@@ -48,18 +49,20 @@
+     }
+     suspend fun status(config: PetSettings): DeviceStatus {
+         val json = request(config, "/api/status")
+-        check(json.getInt("apiVersion") == 2 && json.getBoolean("online")) { "Carga el firmware PetBite v2 incluido en el proyecto." }
++        check(json.getInt("apiVersion") == 3 && json.getBoolean("online")) { "Carga el firmware PetMin v3 incluido en el proyecto." }
+         val level = if (json.isNull("foodLevelPercent")) null else json.getInt("foodLevelPercent")
+         check(level == null || level in 0..100) { "Nivel de alimento inválido." }
+         val last = if (json.isNull("lastDispensedGrams")) null else json.getDouble("lastDispensedGrams")
+         check(last == null || (last.isFinite() && last >= 0)) { "Lectura de peso inválida." }
+         return DeviceStatus(level, last, System.currentTimeMillis(), json.getBoolean("ready"), json.getBoolean("busy"),
+-            json.getBoolean("clockSynced"), json.getString("deviceId"), json.optString("message"), json.optBoolean("simulation", false))
++            json.getBoolean("clockSynced"), json.getString("deviceId"), json.optString("message"), json.optBoolean("simulation", false),
++            if (json.isNull("remainingGrams")) null else json.getDouble("remainingGrams").also { require(it.isFinite() && it >= 0) },
++            json.getLong("nextSequence").also { require(it > 0) }, json.getInt("retentionDays"))
+     }
+-    suspend fun dispense(config: PetSettings, id: String, grams: Int): Double {
++    suspend fun dispense(config: PetSettings, id: String, grams: Int, sequence: Long = 1): Double {
+         require(Validation.portion(grams))
+         // Se envía POST una sola vez. Las consultas posteriores nunca abren la compuerta.
+-        var response = request(config, "/api/dispense", "POST", JSONObject().put("requestId", id).put("grams", grams))
++        var response = request(config, "/api/dispense", "POST", JSONObject().put("requestId", id).put("grams", grams).put("sequence", sequence))
+         repeat(maxPolls) {
+             check(response.getString("requestId") == id) { "La respuesta no corresponde a la orden enviada." }
+             when (response.getString("status")) {
+@@ -78,10 +81,13 @@
+         error("La orden sigue sin confirmación. Actualiza el historial antes de repetir.")
+     }
+     suspend fun events(config: PetSettings): List<FeedEvent> {
+-        val response = request(config, "/api/events")
++        val all = mutableListOf<FeedEvent>()
++        var offset = 0
++        do {
++        val response = request(config, if (offset == 0) "/api/events" else "/api/events?offset=$offset")
+         val array = response.getJSONArray("events")
+         require(array.length() <= 64) { "Respuesta de historial demasiado grande." }
+-        return (0 until array.length()).map { index ->
++        all += (0 until array.length()).map { index ->
+             val item = array.getJSONObject(index)
+             val grams = item.getInt("grams")
+             val timestamp = item.getLong("timestamp")
+@@ -98,6 +104,15 @@
+             FeedEvent(item.getString("requestId"), timestamp, grams, delivered, item.optBoolean("simulation", false),
+                 if (item.getString("source") == "schedule") "Horario ESP32" else "Manual", status, item.optString("detail"))
+         }
++        if (response.isNull("nextOffset")) break
++        val next = response.getInt("nextOffset")
++        require(next > offset && next <= 512) { "Paginacion invalida." }
++        offset = next
++        } while (true)
++        return all.distinctBy { it.id }
++    }
++    suspend fun retention(config: PetSettings) {
++        check(request(config, "/api/preferences", "PUT", JSONObject().put("retentionDays", config.retentionDays)).getBoolean("saved"))
+     }
+     suspend fun schedules(config: PetSettings, values: List<MealSchedule>) {
+         val array = JSONArray()
+--- /dev/null
++++ b/app/src/main/java/com/yuri/petbite/gaming/PetScene.kt
+@@ -0,0 +1,75 @@
++package com.yuri.petbite.gaming
++
++import android.content.Context
++import android.opengl.GLSurfaceView
++import android.opengl.GLU
++import android.os.SystemClock
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import javax.microedition.khronos.egl.EGLConfig
++import javax.microedition.khronos.opengles.GL10
++import kotlin.math.sin
++
++// PETMIN NOTA: geometría 3D original reutilizable, sin recursos externos ni motor pesado.
++// OpenGL ES 1.x basta para una habitación y dos modelos de pocas piezas.
++// PETMIN FUTURO: sustituir este renderer por modelos glTF sin cambiar progreso ni desafíos.
++class PetScene(context: Context) : GLSurfaceView(context) {
++    val scene = PetRenderer()
++    init { setRenderer(scene); renderMode = RENDERMODE_CONTINUOUSLY }
++}
++class PetRenderer : GLSurfaceView.Renderer {
++    @Volatile var cat = false
++    @Volatile var angle = 0f
++    @Volatile var animation = "idle"
++    @Volatile var animationUntil = 0L
++    fun animate(value: String) { animation = value; animationUntil = SystemClock.uptimeMillis() + 2200 }
++    private val vertices = floatArrayOf(
++        -1f,-1f,1f, 1f,-1f,1f, 1f,1f,1f, -1f,1f,1f,
++        -1f,-1f,-1f, 1f,-1f,-1f, 1f,1f,-1f, -1f,1f,-1f)
++    private val faces = byteArrayOf(0,1,2,0,2,3, 5,4,7,5,7,6, 4,0,3,4,3,7, 1,5,6,1,6,2, 3,2,6,3,6,7, 4,5,1,4,1,0)
++    private val vb = ByteBuffer.allocateDirect(vertices.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(vertices); position(0) }
++    private val ib = ByteBuffer.allocateDirect(faces.size).apply { put(faces); position(0) }
++    override fun onSurfaceCreated(gl: GL10, config: EGLConfig) {
++        gl.glClearColor(.90f,.95f,.96f,1f); gl.glEnable(GL10.GL_DEPTH_TEST)
++        gl.glEnableClientState(GL10.GL_VERTEX_ARRAY)
++    }
++    override fun onSurfaceChanged(gl: GL10, width: Int, height: Int) {
++        gl.glViewport(0,0,width,height); gl.glMatrixMode(GL10.GL_PROJECTION); gl.glLoadIdentity()
++        GLU.gluPerspective(gl, 42f, width.toFloat()/height.coerceAtLeast(1), .1f, 30f)
++    }
++    private fun box(gl: GL10,x:Float,y:Float,z:Float,sx:Float,sy:Float,sz:Float,r:Float,g:Float,b:Float) {
++        gl.glPushMatrix(); gl.glTranslatef(x,y,z); gl.glScalef(sx,sy,sz)
++        gl.glColor4f(r,g,b,1f); gl.glVertexPointer(3,GL10.GL_FLOAT,0,vb)
++        gl.glDrawElements(GL10.GL_TRIANGLES, faces.size,GL10.GL_UNSIGNED_BYTE,ib); gl.glPopMatrix()
++    }
++    override fun onDrawFrame(gl: GL10) {
++        gl.glClear(GL10.GL_COLOR_BUFFER_BIT or GL10.GL_DEPTH_BUFFER_BIT)
++        gl.glMatrixMode(GL10.GL_MODELVIEW); gl.glLoadIdentity(); GLU.gluLookAt(gl,3.4f,2.7f,5.4f,0f,.7f,0f,0f,1f,0f)
++        box(gl,0f,-.1f,0f,2.5f,.1f,2f,.72f,.82f,.79f)
++        box(gl,0f,1.3f,-2f,2.5f,1.4f,.06f,.80f,.88f,.91f)
++        box(gl,-2.5f,1.3f,0f,.06f,1.4f,2f,.86f,.91f,.92f)
++        box(gl,0f,.02f,0f,1.35f,.02f,1.1f,.48f,.65f,.64f)
++        box(gl,.1f,.13f,1.12f,.35f,.13f,.28f,.18f,.42f,.53f)
++        val now = SystemClock.uptimeMillis(); val phase = now / 180.0
++        val mode = if(now < animationUntil) animation else "idle"
++        gl.glPushMatrix(); gl.glRotatef(angle,-0f,1f,0f)
++        val bounce = if(mode == "happy") (sin(phase)*.12).toFloat() else (sin(phase*.3)*.015).toFloat()
++        gl.glTranslatef(0f,bounce,0f)
++        val r = if(cat) .65f else .68f; val g = if(cat) .68f else .43f; val b = if(cat) .73f else .25f
++        box(gl,0f,.65f,0f,.42f,.35f,.65f,r,g,b)
++        for(x in listOf(-.28f,.28f)) for(z in listOf(-.4f,.4f)) box(gl,x,.28f,z,.12f,.27f,.13f,r*.85f,g*.85f,b*.85f)
++        gl.glPushMatrix(); gl.glTranslatef(0f,1.1f,.55f)
++        if(mode == "eat") gl.glRotatef(22f + (sin(phase)*12).toFloat(),1f,0f,0f)
++        box(gl,0f,0f,0f,.38f,.34f,.32f,r,g,b)
++        for(x in listOf(-.26f,.26f)) {
++            box(gl,x,if(cat) .4f else -.03f,if(cat) 0f else -.03f,if(cat) .11f else .13f,if(cat) .22f else .38f,.12f,r*.8f,g*.8f,b*.8f)
++            box(gl,x*.65f,.08f,.327f,.055f,.065f,.025f,.06f,.08f,.1f)
++        }
++        box(gl,0f,-.12f,.36f,.18f,.12f,.12f,.87f,.78f,.65f)
++        box(gl,0f,-.08f,.49f,.065f,.045f,.02f,.12f,.1f,.1f)
++        gl.glPopMatrix()
++        gl.glPushMatrix(); gl.glTranslatef(0f,.8f,-.63f); gl.glRotatef((sin(phase)*if(mode=="happy") 40 else 12).toFloat(),0f,1f,0f)
++        box(gl,0f,.13f,-.28f,.07f,.09f,.38f,r,g,b); gl.glPopMatrix()
++        gl.glPopMatrix()
++    }
++}
+--- /dev/null
++++ b/app/src/main/java/com/yuri/petbite/ui/GamingScreen.kt
+@@ -0,0 +1,71 @@
++package com.yuri.petbite.ui
++
++import android.content.Context
++import androidx.compose.foundation.layout.*
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.material3.*
++import androidx.compose.runtime.*
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.viewinterop.AndroidView
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.lifecycle.compose.LocalLifecycleOwner
++import com.yuri.petbite.gaming.PetScene
++
++private data class Challenge(val question: String, val options: List<String>, val answer: Int, val explanation: String)
++private val challenges = listOf(
++    Challenge("¿Qué eliges para su alimentación habitual?", listOf("Alimento completo para su especie y etapa", "Solo premios"),0,"La base debe ser alimento completo adecuado para perro o gato y su etapa. Los premios no sustituyen sus comidas."),
++    Challenge("Encuentras chocolate. ¿Qué haces?",listOf("Se lo doy como premio", "Lo guardo fuera de su alcance"),1,"El chocolate puede intoxicar a perros y gatos. Nunca se ofrece como premio."),
++    Challenge("¿Compartimos comida con cebolla o ajo?",listOf("No, la apartamos", "Sí, si está cocinada"),0,"La cebolla y el ajo pueden dañar los glóbulos rojos. Cocinarlos no los convierte en alimento adecuado."),
++    Challenge("¿Qué hago con uvas y pasas?",listOf("Las uso como premio", "Las mantengo fuera de su alcance"),1,"Las uvas y pasas pueden causar daño renal en perros. Evita ofrecérselas a tu mascota; ante una ingestión consulta al veterinario."),
++    Challenge("¿Cómo decido los gramos diarios?",listOf("Solo por la apariencia", "Con indicaciones apropiadas y seguimiento"),1,"El propietario configura porciones con orientación adecuada, alimento y necesidades individuales. Mantén agua fresca disponible.")
++)
++@Composable fun GamingScreen() {
++    val context = LocalContext.current
++    val prefs = remember { context.getSharedPreferences("petmin_gaming", Context.MODE_PRIVATE) }
++    var name by remember { mutableStateOf(prefs.getString("name", "Luna") ?: "Luna") }
++    var cat by remember { mutableStateOf(prefs.getBoolean("cat", false)) }
++    var completed by remember { mutableIntStateOf(prefs.getInt("completed", 0).coerceIn(0,5)) }
++    var selected by remember { mutableStateOf<Int?>(null) }
++    var feedback by remember { mutableStateOf("") }
++    var rotation by remember { mutableFloatStateOf(0f) }
++    val view = remember { PetScene(context) }
++    val owner = LocalLifecycleOwner.current
++    DisposableEffect(owner, view) {
++        val observer = LifecycleEventObserver { _, event -> when(event) {
++            Lifecycle.Event.ON_RESUME -> view.onResume()
++            Lifecycle.Event.ON_PAUSE -> view.onPause()
++            else -> Unit
++        } }
++        owner.lifecycle.addObserver(observer)
++        onDispose { owner.lifecycle.removeObserver(observer); view.onPause() }
++    }
++    // PETMIN SEGURIDAD: esta pantalla no recibe FeederApi ni PetViewModel. No puede dispensar.
++    LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
++        item { Text("PetMin Gaming", style = MaterialTheme.typography.headlineMedium); Text("Aprende a cuidar · ${completed * 20} puntos · $completed/5 desafíos") }
++        item { AndroidView(factory = { view }, update = { it.scene.cat = cat; it.scene.angle = rotation }, modifier = Modifier.fillMaxWidth().height(260.dp)) }
++        item { Text("Girar habitación"); Slider(rotation, { rotation = it }, valueRange = -35f..35f) }
++        item { OutlinedTextField(name, { name = it.take(30); prefs.edit().putString("name",name).apply() }, label = { Text("Nombre de tu mascota virtual") }, singleLine = true) }
++        item { Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { listOf(false,true).forEach { c -> FilterChip(cat == c, { cat = c; prefs.edit().putBoolean("cat",c).apply() }, label = { Text(if(c) "Gato" else "Perro") }) } }
++        item { Text("${name.ifBlank { "Tu mascota" }} vive solo en el juego. Ninguna acción entrega alimento real.") }
++        if(completed < challenges.size) {
++            val challenge = challenges[completed]
++            item { Text(challenge.question, style = MaterialTheme.typography.titleLarge) }
++            item { Column { challenge.options.forEachIndexed { index, text ->
++                OutlinedButton(onClick = { selected = index; feedback = if(index == challenge.answer) "¡Correcto! ${challenge.explanation}" else "Inténtalo de nuevo. ${challenge.explanation}" }, modifier = Modifier.fillMaxWidth()) { Text(text) }
++            } } }
++            item { Text(feedback) }
++            item { Button(enabled = selected == challenge.answer, onClick = {
++                completed++; prefs.edit().putInt("completed", completed).apply()
++                view.scene.animate(if(completed == 1) "eat" else "happy")
++                selected = null; feedback = ""
++            }) { Text("Guardar logro y continuar") } }
++        } else {
++            item { Text("¡Completaste los cinco desafíos! Tu progreso está guardado.") }
++            item { Row { Button(onClick = { view.scene.animate("happy") }) { Text("Celebrar") }; TextButton(onClick = { view.scene.animate("eat") }) { Text("Comida virtual") } } }
++        }
++        item { Text("Contenido educativo: ASPCA, People Foods to Avoid Feeding Your Pets. Ante ingestión sospechosa contacta a un veterinario. No esperes síntomas.", style = MaterialTheme.typography.bodySmall) }
++    }
++}
+--- a/app/src/main/java/com/yuri/petbite/ui/PetApp.kt
++++ b/app/src/main/java/com/yuri/petbite/ui/PetApp.kt
+@@ -36,7 +36,7 @@
+ 
+ private data class Tab(val label: String, val icon: ImageVector)
+ private val tabs = listOf(Tab("Inicio", Icons.Outlined.Home), Tab("Porción", Icons.Outlined.Pets),
+-    Tab("Horarios", Icons.Outlined.Schedule), Tab("Historial", Icons.Outlined.History), Tab("Ajustes", Icons.Outlined.Settings))
++    Tab("Horarios", Icons.Outlined.Schedule), Tab("Gaming", Icons.Outlined.SportsEsports), Tab("Historial", Icons.Outlined.History), Tab("Ajustes", Icons.Outlined.Settings))
+ private val timeFormat = DateTimeFormatter.ofPattern("HH:mm")
+ private fun timeLabel(hour: Int, minute: Int) = LocalTime.of(hour, minute).format(timeFormat)
+ private fun weight(value: Double) = if (value == value.toInt().toDouble()) "${value.toInt()}" else String.format(Locale.getDefault(), "%.1f", value)
+@@ -73,8 +73,9 @@
+                 0 -> HomeScreen(settings, schedules, events, device, busy, { tab = 1 }, { tab = 2 }, vm::refresh, vm::stop)
+                 1 -> PortionScreen(settings, device, busy, vm::feed, vm::stop)
+                 2 -> ScheduleScreen(vm, settings, schedules, busy)
+-                3 -> HistoryScreen(events)
+-                4 -> SettingsScreen(settings, busy, vm::saveSettings, vm::refresh, vm::setRetentionDays)
++                3 -> GamingScreen()
++                4 -> HistoryScreen(events)
++                5 -> SettingsScreen(settings, busy, vm::saveSettings, vm::refresh, vm::setRetentionDays)
+             }
+             if (busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter))
+         }
+@@ -126,29 +127,28 @@
+     }
+     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+         item { PageTitle("Hola, ${config.petName}", "Un cuidado, todos los días.") }
+-        if (!false) item { Info(when {
++        item { Info(when {
+             device == null -> "Sin conexión. Configura la dirección y clave del ESP32 en Ajustes. Se vuelve a intentar automáticamente."
+             device.simulation -> "ESP32 conectado en SIMULACIÓN: no mueve el motor."
+             device.busy -> "ESP32 conectado · Sirviendo alimento."
+             device.ready -> "ESP32 conectado · Listo para servir."
+             else -> "ESP32 conectado · ${device.message}"
+         }, device?.ready != true || device.simulation) }
+-        if (!false && (busy || device?.busy == true)) item { Button(onClick = stop, modifier = Modifier.fillMaxWidth(),
++        if (busy || device?.busy == true) item { Button(onClick = stop, modifier = Modifier.fillMaxWidth(),
+             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Detener dispensador") } }
+         item {
+             Card(shape = RoundedCornerShape(28.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)) {
+                 Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                         Column(Modifier.weight(1f)) {
+-                            Text("DEPÓSITO DE ALIMENTO", style = MaterialTheme.typography.labelMedium)
+-                            Text(level?.let { "$it%" } ?: "—", fontSize = 48.sp, fontWeight = FontWeight.Bold)
++                            Text("DEPÓSITO · ${level?.let { "$it%" } ?: "sin lectura"}", style = MaterialTheme.typography.labelMedium)
++                            Text(device?.remainingGrams?.let { "${weight(it)} g" } ?: "—", fontSize = 48.sp, fontWeight = FontWeight.Bold)
+                         }
+                         Icon(Icons.Outlined.Pets, "Depósito de alimento", modifier = Modifier.size(62.dp), tint = MaterialTheme.colorScheme.primary)
+                     }
+                     LinearProgressIndicator(progress = { (level ?: 0) / 100f }, modifier = Modifier.fillMaxWidth().height(8.dp).semantics { contentDescription = level?.let { "Depósito al $it por ciento" } ?: "Nivel del depósito no disponible" },
+                         trackColor = MaterialTheme.colorScheme.surface.copy(alpha = .6f))
+                     Text(when {
+-                        false -> "Dato simulado · ${0} g de 1500 g"
+                         device == null -> "Sin lectura · comprueba la conexión"
+                         else -> "Última lectura: " + Instant.ofEpochMilli(device.checkedAt).atZone(ZoneId.systemDefault()).format(timeFormat)
+                     }, style = MaterialTheme.typography.bodySmall)
+@@ -163,7 +163,7 @@
+         item { Button(onClick = feed, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp), shape = RoundedCornerShape(16.dp)) {
+             Icon(Icons.Outlined.Pets, null); Spacer(Modifier.width(10.dp)); Text("Dispensar ahora")
+         } }
+-        if (!false) item { OutlinedButton(onClick = refresh, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
++        item { OutlinedButton(onClick = refresh, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+             Icon(Icons.Outlined.Refresh, null); Spacer(Modifier.width(8.dp)); Text("Actualizar estado")
+         } }
+         item { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+@@ -197,10 +197,10 @@
+         item { Button(onClick = { confirm = true }, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+             Text(if (busy) "Procesando…" else "Dispensar ${grams.roundToInt()} g")
+         } }
+-        if (!false && (busy || device?.busy == true)) item { Button(onClick = stop, modifier = Modifier.fillMaxWidth(),
++        if (busy || device?.busy == true) item { Button(onClick = stop, modifier = Modifier.fillMaxWidth(),
+             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)) { Text("Detener dispensador") } }
+         item { Info("Ajusta la porción según la alimentación de tu mascota. Los valores de los botones son ejemplos, no una recomendación de dieta.", true) }
+-        if (!false) item { Info("La app comprueba el ESP32 antes de enviar la orden. El peso servido se registra cuando el dispositivo confirma la entrega.") }
++        item { Info("La app comprueba el ESP32 antes de enviar la orden. El peso servido se registra cuando el dispositivo confirma la entrega.") }
+     }
+     if (confirm) AlertDialog(onDismissRequest = { confirm = false }, title = { Text("¿Servir alimento?") },
+         text = { Text("Se solicitarán ${grams.roundToInt()} g al dispensador. Comprueba que el recipiente esté colocado.") },
+@@ -219,7 +219,7 @@
+         item { Button(onClick = { editing = null; showEditor = true }, enabled = !busy && schedules.size < 12, modifier = Modifier.fillMaxWidth()) {
+             Icon(Icons.Outlined.Add, null); Spacer(Modifier.width(8.dp)); Text("Agregar horario")
+         } }
+-        if (!false) item { OutlinedButton(onClick = vm::syncSchedules, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Enviar horarios al ESP32") } }
++        item { OutlinedButton(onClick = vm::syncSchedules, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("Enviar horarios al ESP32") } }
+         if (schedules.isEmpty()) item { EmptyState(Icons.Outlined.Schedule, "Su rutina comienza aquí", "Agrega la hora y la porción de su primera comida.") }
+         items(schedules, key = { it.id }) { value ->
+             Card(shape = RoundedCornerShape(20.dp)) {
+@@ -303,7 +303,7 @@
+     val dirty = name != config.petName || address != config.address || token != config.token
+     LazyColumn(contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+         item { PageTitle("Configuración PetMin", "Conecta tu dispensador real.") }
+-        item { OutlinedTextField(value = name, onValueChange = { name = it.take(40) }, label = { Text("Nombre de tu mascota") },
++        item { OutlinedTextField(value = name, onValueChange = { name = it.take(40) }, label = { Text("Nombre para el saludo") },
+             singleLine = true, enabled = !busy, modifier = Modifier.fillMaxWidth()) }
+         item { OutlinedTextField(value = address, onValueChange = { address = it }, label = { Text("Dirección del ESP32") },
+             placeholder = { Text("http://192.168.1.100") }, supportingText = { Text("El teléfono y ESP32 deben compartir la red Wi-Fi.") },
+@@ -313,12 +313,14 @@
+         item { Button(onClick = { save(name, address, token) }, enabled = !busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("Guardar configuración") } }
+         item { OutlinedButton(onClick = connect, enabled = !busy && !dirty, modifier = Modifier.fillMaxWidth()) { Text("Probar conexión") } }
+         if (dirty) item { Info("Guarda los cambios antes de probar la conexión.", true) }
+-        item { Info("Configura firmware/PetBiteESP32/Config.h con el Wi-Fi, clave y calibración reales. No existe modo demo.", true) }
++        item { Info("Configura firmware/PetBiteESP32/Secrets.h con Wi-Fi y clave; Config.h con calibración real. No existe modo demo.", true) }
+         item { Text("Conservar historial", fontWeight = FontWeight.Bold) }
+         item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+             FilterChip(selected = config.retentionDays == 7, onClick = { retention(7) }, label = { Text("7 días") })
+             FilterChip(selected = config.retentionDays == 30, onClick = { retention(30) }, label = { Text("30 días") })
+         } }
++        item { ProfilePanel() }
++        item { CalibrationGuide() }
+         item { Text("PetMin 3.0 · Android + ESP32", style = MaterialTheme.typography.bodySmall) }
+     }
+ }
+--- /dev/null
++++ b/app/src/main/java/com/yuri/petbite/ui/Profiles.kt
+@@ -0,0 +1,86 @@
++package com.yuri.petbite.ui
++
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import androidx.activity.compose.rememberLauncherForActivityResult
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.compose.foundation.Image
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.layout.*
++import androidx.compose.material3.*
++import androidx.compose.runtime.*
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.asImageBitmap
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.unit.dp
++import android.graphics.BitmapFactory
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import org.json.JSONArray
++import org.json.JSONObject
++import java.util.UUID
++import com.yuri.petbite.data.PetProfile
++import com.yuri.petbite.data.ProfileStore
++
++@Composable fun ProfilePanel() {
++    val context = LocalContext.current
++    val store = remember { ProfileStore(context) }
++    var profiles by remember { mutableStateOf(store.read()) }
++    var editing by remember { mutableStateOf<PetProfile?>(null) }
++    var show by remember { mutableStateOf(false) }
++    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text("Perfiles de mascotas", style = MaterialTheme.typography.titleLarge)
++        profiles.forEach { p ->
++            Card { Column(Modifier.padding(12.dp)) {
++                Text("${p.name} · ${p.species}")
++                Text("Edad: ${p.age.ifBlank { "sin indicar" }} meses · Peso: ${p.weight.ifBlank { "sin indicar" }} kg")
++                Text(p.food)
++                if(p.photo.isNotBlank()) {
++                    val bitmap by produceState<android.graphics.Bitmap?>(null, p.photo) {
++                        value = withContext(Dispatchers.IO) { runCatching {
++                            context.contentResolver.openInputStream(Uri.parse(p.photo))?.use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = 8 }) }
++                        }.getOrNull() }
++                    }
++                    bitmap?.let { Image(it.asImageBitmap(), "Foto de ${p.name}", Modifier.size(96.dp)) }
++                }
++                TextButton(onClick = { editing = p; show = true }) { Text("Editar perfil") }
++            } }
++        }
++        OutlinedButton(onClick = { editing = null; show = true }) { Text("Registrar mascota") }
++    }
++    if(show) {
++        var name by remember { mutableStateOf(editing?.name ?: "") }
++        var species by remember { mutableStateOf(editing?.species ?: "Perro") }
++        var age by remember { mutableStateOf(editing?.age ?: "") }
++        var weight by remember { mutableStateOf(editing?.weight ?: "") }
++        var food by remember { mutableStateOf(editing?.food ?: "") }
++        var photo by remember { mutableStateOf(editing?.photo ?: "") }
++        val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++            if(uri != null) { runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }.onSuccess { photo = uri.toString() } }
++        }
++        val valid = name.isNotBlank() && (age.isBlank() || age.toIntOrNull()?.let { it in 0..600 } == true) && (weight.isBlank() || weight.toDoubleOrNull()?.let { it.isFinite() && it > 0 && it <= 200 } == true)
++        AlertDialog(onDismissRequest = { show = false }, title = { Text("Perfil") }, text = {
++            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(4.dp)) {
++                OutlinedTextField(name, { name = it.take(40) }, label = { Text("Nombre") })
++                Row { listOf("Perro", "Gato").forEach { s -> FilterChip(species == s, { species = s }, label = { Text(s) }) } }
++                OutlinedTextField(age, { age = it.take(3) }, label = { Text("Edad aproximada en meses") })
++                OutlinedTextField(weight, { weight = it.replace(',', '.').take(6) }, label = { Text("Peso en kg (opcional)") })
++                OutlinedTextField(food, { food = it.take(160) }, label = { Text("Preferencias de alimentación") })
++                TextButton(onClick = { picker.launch(arrayOf("image/*")) }) { Text(if(photo.isBlank()) "Elegir foto" else "Cambiar foto") }
++                Text("Las porciones las configura el propietario; estos datos no calculan una dieta.")
++            }
++        }, confirmButton = { TextButton(enabled = valid, onClick = {
++            val p = PetProfile(editing?.id ?: UUID.randomUUID().toString(), name.trim(), species, age, weight, food, photo)
++            profiles = profiles.filterNot { it.id == p.id } + p; store.save(profiles); show = false
++        }) { Text("Guardar") } }, dismissButton = { TextButton(onClick = { show = false }) { Text("Cancelar") } })
++    }
++}
++@Composable fun CalibrationGuide() {
++    Card { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
++        Text("Calibración HX711", style = MaterialTheme.typography.titleMedium)
++        Text("1. Deshabilita el actuador en Config.h y monta la tolva vacía.\n2. Anota el promedio raw del monitor serie como ZERO.\n3. Añade una masa conocida y calcula (raw con masa − ZERO) / gramos.\n4. Guarda el factor en Config.h, activa HX711_CALIBRATED y carga el firmware.\n5. Comprueba varias masas antes de habilitar el servo.")
++        Text("La calibración se realiza por USB, con el mecanismo supervisado. Capacidad configurada: 2000 g; no es el límite de 10 kg de la celda.")
++    } }
++}
+--- a/app/src/test/java/com/yuri/petbite/device/FeederApiTest.kt
++++ b/app/src/test/java/com/yuri/petbite/device/FeederApiTest.kt
+@@ -27,7 +27,7 @@
+             }
+         }
+         server.start()
+-        config = PetSettings(demo = false, address = server.url("/").toString().trimEnd('/'), token = "test-key")
++        config = PetSettings(address = server.url("/").toString().trimEnd('/'), token = "test-key")
+     }
+     @After fun stopServer() { server.shutdown() }
+     @Test fun asyncDeliverySendsOnlyOnePost() = runBlocking {
+@@ -35,7 +35,7 @@
+         responder = { path, method, body, auth ->
+             assertEquals("Bearer test-key", auth)
+             if (method == "POST") {
+-                assertEquals("/api/dispense", path); assertEquals(40, JSONObject(body).getInt("grams")); posts.incrementAndGet()
++                assertEquals("/api/dispense", path); assertEquals(1L, JSONObject(body).getLong("sequence")); assertEquals(40, JSONObject(body).getInt("grams")); posts.incrementAndGet()
+                 202 to """{"requestId":"test-job-123","status":"accepted"}"""
+             } else {
+                 assertEquals("/api/jobs/test-job-123", path)
+@@ -68,7 +68,7 @@
+         assertTrue(runCatching { FeederApi().dispense(config, "test-job-123", 40) }.isFailure)
+     }
+     @Test fun missingLevelDoesNotBecomeFakeMeasurement() = runBlocking {
+-        responder = { _, _, _, _ -> 200 to """{"apiVersion":2,"online":true,"foodLevelPercent":null,"lastDispensedGrams":null,"ready":false,"busy":false,"clockSynced":true,"deviceId":"ESP123","message":"Sin calibrar","simulation":false}""" }
++        responder = { _, _, _, _ -> 200 to """{"apiVersion":3,"nextSequence":1,"retentionDays":30,"online":true,"foodLevelPercent":null,"lastDispensedGrams":null,"ready":false,"busy":false,"clockSynced":true,"deviceId":"ESP123","message":"Sin calibrar","simulation":false}""" }
+         val status = FeederApi().status(config)
+         assertNull(status.levelPercent); assertFalse(status.ready); assertEquals("Sin calibrar", status.message)
+     }
+@@ -102,4 +102,29 @@
+         }
+         FeederApi().stop(config)
+     }
++    @Test fun historyFollowsPages() = runBlocking {
++        val paths = mutableListOf<String>()
++        responder = { path, _, _, _ -> paths += path
++            if(path == "/api/events") 200 to """{"events":[],"nextOffset":32}"""
++            else 200 to """{"events":[],"nextOffset":null}"""
++        }
++        assertTrue(FeederApi().events(config).isEmpty())
++        assertEquals(listOf("/api/events", "/api/events?offset=32"), paths)
++    }
++    @Test fun repeatedPageIsRejected() = runBlocking {
++        responder = { _, _, _, _ -> 200 to """{"events":[],"nextOffset":0}""" }
++        assertTrue(runCatching { FeederApi().events(config) }.isFailure)
++    }
++    @Test fun retentionIsConfirmedByDevice() = runBlocking {
++        responder = { path, method, body, _ ->
++            assertEquals("/api/preferences",path); assertEquals("PUT",method)
++            assertEquals(7,JSONObject(body).getInt("retentionDays"))
++            200 to """{"saved":true}"""
++        }
++        FeederApi().retention(config.copy(retentionDays=7))
++    }
++    @Test fun oldFirmwareIsRejected() = runBlocking {
++        responder = { _, _, _, _ -> 200 to """{"apiVersion":2,"online":true}""" }
++        assertTrue(runCatching { FeederApi().status(config) }.isFailure)
++    }
+ }
+--- a/docs/API_ESP32.md
++++ b/docs/API_ESP32.md
+@@ -1,77 +1,26 @@
+-# API PetBite v2 — implementada en el firmware incluido
++# PetMin API 3
+ 
+-Base: `http://IP_DEL_ESP32`. JSON UTF-8. Todas las rutas requieren la cabecera
+-`Authorization: Bearer <API_TOKEN>`. La clave de ejemplo debe cambiarse.
++HTTP local, Authorization: Bearer <API_TOKEN>, JSON UTF-8. Android rechaza API 2; distribuir firmware y app juntos.
+ 
+-| Método y ruta | Función |
++| Método/ruta | Función |
+ |---|---|
+-| GET /api/status | Estado, disponibilidad, calibración, reloj, nivel y modo de simulación |
+-| POST /api/dispense | Aceptar una orden identificada y comenzar la entrega |
+-| GET /api/jobs/{requestId} | Consultar la misma orden sin volver a ejecutarla |
+-| GET /api/events | Últimos 16 eventos persistentes, manuales y automáticos |
+-| PUT /api/schedules | Reemplazar toda la lista de horarios del equipo |
+-| POST /api/stop | Cerrar compuerta y terminar la orden activa como detenida |
++| GET /api/status | Estado, medición y próxima secuencia |
++| POST /api/dispense | Orden manual única |
++| GET /api/jobs/{id} | Consultar últimas 16 órdenes sin accionar |
++| POST /api/stop | Cerrar y registrar fallo, peso desconocido |
++| PUT /api/schedules | Reemplazar hasta 12 horarios, incluida lista vacía |
++| GET /api/events?offset=0 | Página de 32 eventos |
++| PUT /api/preferences | Retención 7/30 días |
+ 
+-## Estado
++Status: apiVersion=3, online, deviceId, simulation=false, busy, clockSynced, ready, message, remainingGrams, foodLevelPercent, lastDispensedGrams, nextSequence, retentionDays. Medidas desconocidas son null. Online no implica ready.
+ 
+-```json
+-{"apiVersion":2,"online":true,"deviceId":"ABC123","ready":true,"busy":false,"clockSynced":true,"foodLevelPercent":75,"lastDispensedGrams":39.8,"message":"","simulation":false}
+-```
++Orden: `{"requestId":"uuid-orden-001","grams":40,"sequence":1}`. Gramos 5–300. Leer nextSequence antes de solicitar; se persiste antes de mover. Repetir ID reciente devuelve resultado previo; secuencia antigua se rechaza aun si su evento fue eliminado. Varios teléfonos con misma secuencia: uno gana; el otro debe actualizar y requerir otra acción explícita. No repetir POST tras timeout. Borrar NVS reinicia protección y exige puesta en servicio supervisada.
+ 
+-Nivel y último peso pueden ser `null`. Estar conectado no implica estar calibrado
+-ni listo. `ready=false` tiene un mensaje explicativo. La app rechaza API de otra versión.
++Evento: requestId, timestamp Unix en milisegundos, grams, dispensedGrams nullable, source manual/schedule, status accepted/dispensing/completed/failed/interrupted, detail, simulation=false. Completed exige tolerancia configurada, no certifica llegada al plato. Fallo puede incluir peso parcial. Rechazo explícito HTTP no 2xx tiene rejected=true; otros errores se consideran inciertos.
+ 
+-## Entregas asíncronas
++Horarios: `{"timezone":"America/Lima","schedules":[{"id":"uuid-horario-001","hour":8,"minute":0,"grams":40,"enabled":true}]}`. Respuesta saved=true,count=1. Sin horas/IDs duplicados; marca diaria conservada por ID.
+ 
+-POST (una sola vez): `{"requestId":"uuid-de-la-app","grams":40}`.
+-HTTP 202 devuelve el evento con estado `dispensing` o `accepted`. La app consulta
+-GET /api/jobs/uuid hasta obtener `completed`, `failed` o `interrupted`. Nunca repite
+-el POST automáticamente ante timeout. Una respuesta completa de ejemplo:
++Preferencias: `{"retentionDays":7}`, respuesta saved=true.
++Historial: events más nextOffset (32,64,... o null al finalizar), máximo 512 archivos. Durante entrega devuelve caché de últimas órdenes para evitar acceso prolongado a flash; sincronización posterior recoge archivo completo. Room deduplica por ID. Paginación no es instantánea transaccional: cambios concurrentes se reconcilian al siguiente refresco.
+ 
+-```json
+-{"requestId":"uuid-de-la-app","grams":40,"timestamp":1791676800000,"source":"manual","status":"completed","dispensedGrams":39.8,"detail":"","simulation":false}
+-```
+-
+-`timestamp` está en milisegundos Unix. `source` es `manual` o `schedule`.
+-Una orden repetida con un ID presente en los últimos 16 registros devuelve el
+-mismo evento; no vuelve a abrir la compuerta. Cambiar la porción para ese mismo ID
+-se rechaza. Esta protección está limitada a la ventana conservada en el dispositivo.
+-
+-Se persiste la aceptación antes de mover. Al reiniciar, una entrega que no tenía
+-resultado final se marca `interrupted`, se cierra el mecanismo configurado y no se
+-repite. Un fallo puede incluir una cantidad parcial medida: no se cuenta como entrega
+-completa. Si la conexión se pierde, el equipo termina o detiene su trabajo de forma
+-local; la app recupera el resultado después desde /api/events.
+-
+-GET /api/events devuelve `{"events":[...]}`. La app importa por identificador con
+-reemplazo para reconciliar órdenes locales pendientes sin duplicar las confirmadas.
+-
+-## Horarios
+-
+-```json
+-{"timezone":"America/Lima","schedules":[{"id":"uuid-horario","hour":8,"minute":0,"grams":40,"enabled":true}]}
+-```
+-
+-Respuesta: `{"saved":true,"count":1}`. Lista vacía borra todos los horarios.
+-Máximo 12 entradas, porción 5–300 g, hora 0–23, minuto 0–59, sin IDs ni horas
+-repetidos. Solo se admite America/Lima. Se guarda en NVS y se ejecuta en el reloj
+-local del ESP32. No se recuperan minutos perdidos. La marca del día se conserva
+-cuando se reenvía o edita el mismo ID; impide repetirlo ese día.
+-
+-La app exige confirmación `saved=true` y cantidad exacta. Cambios no enviados
+-no afectan a la programación que ya está en el dispositivo.
+-
+-## Detención y errores
+-
+-POST /api/stop con `{}` devuelve `{"stopped":true}` solo después de ordenar el
+-cierre. La orden activa pasa a `failed` con explicación de detención. Es una orden
+-por Wi-Fi; si no llega, el teléfono no puede garantizar la detención física.
+-
+-Los rechazos anteriores a ejecutar incluyen `{"rejected":true,"error":"motivo"}`
+-y código 400/401/409/503. Un fallo de red no equivale a un rechazo confirmado.
+-
+-## Fuentes de las bibliotecas
+-
+-- ESP32 Arduino, Preferences y LEDC: https://docs.espressif.com/projects/arduino-esp32/en/latest/
+-- HX711 de Bogdan Necula: https://github.com/bogde/HX711
+-- ArduinoJson 6: https://arduinojson.org/v6/doc/
++Secuencia no sustituye token. Gaming no recibe cliente API ni envía órdenes.
+--- a/docs/CONFIGURAR_ESP32.md
++++ b/docs/CONFIGURAR_ESP32.md
+@@ -1,130 +1,56 @@
+-# Configurar tu dispensador
++# Configurar ESP32, circuito y calibración
+ 
+-## Montaje para el que está preparado
++## Conexiones para ESP32 clásico
++| Elemento | Conexión |
++|---|---|
++| Señal SG90 | GPIO13 |
++| Alimentación SG90 | Fuente externa regulada 5 V, corriente suficiente según corriente de bloqueo del servo |
++| Tierra servo | GND común con ESP32 y fuente |
++| HX711 DT/DOUT | GPIO32 |
++| HX711 SCK | GPIO33 |
++| Lógica HX711 | Compatible con 3,3 V; verificar módulo |
++| Celda 10 kg | E+/E− excitación, A+/A− señal según ficha; no asumir colores |
++| Buzzer activo | GPIO25 mediante transistor si supera corriente admisible del GPIO |
+ 
+-ESP32 DevKit V1 (ESP32 clásico), MG996R que abre/cierra una compuerta, celda de carga
+-con HX711 bajo el recipiente y HC-SR04 sobre el alimento del depósito. Si usas un
+-motor de pasos, tornillo sinfín u otra placa, el control del actuador debe adaptarse.
+-Los siguientes pines son **propuestos**, no una afirmación de tu cableado actual.
++No alimentar servo desde 3,3 V ni introducir señales de 5 V al ESP32. La celda pesa la tolva completa; descontar estructura vacía en la tara. Evitar apoyos adicionales y cables tirantes que desvíen peso. No se utiliza HC-SR04, RFID ni balanza bajo el plato.
+ 
+-| Elemento | Pin del ESP32 |
+-|---|---:|
+-| Señal del servomotor | GPIO 18 |
+-| HX711 DT/DOUT | GPIO 32 |
+-| HX711 SCK | GPIO 33 |
+-| HC-SR04 TRIG | GPIO 26 |
+-| HC-SR04 ECHO (adaptado a 3,3 V) | GPIO 27 |
++El servo sin corriente NO garantiza cierre. Incorporar compuerta de retorno mecánico y corte físico de alimentación antes de uso autónomo. El watchdog no resuelve un corte eléctrico o atasco mecánico.
+ 
+-Usa alimentación externa adecuada para el servo y tierra común con el ESP32. No
+-alimentes el MG996R desde el pin de 3,3 V. El ECHO del HC-SR04 es de 5 V: coloca un
+-divisor (por ejemplo, 1 kΩ entre ECHO y GPIO, y 2 kΩ entre GPIO y GND) o adaptador de
+-nivel. La interfaz digital del HX711 debe ser compatible con lógica de 3,3 V.
+-Los LEDs, buzzer y botón opcionales del prototipo no son necesarios para esta versión.
++## Herramientas objetivo
++Arduino IDE, ESP32 Dev Module clásico, core Espressif 3.0.7, ArduinoJson 6.21.5, HX711 de Bogdan Necula 0.7.5. Versiones heredadas, pendientes de compilar esta revisión. WiFi/WebServer/Preferences/LittleFS incluidos en core. PWM LEDC a 50 Hz, sin dependencia ESP32Servo. Elegir partición con espacio de archivos de al menos 512 KiB.
++URL de placas: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+ 
+-## Instalar las herramientas
++## Wi-Fi e instalación
++1. Abrir firmware/PetBiteESP32/PetBiteESP32.ino.
++2. Copiar Secrets.h.example como Secrets.h; completar SSID 2,4 GHz, contraseña y token propio ≥8 caracteres. Nunca subir Secrets.h ni incluirlo en ZIP compartidos.
++3. Mantener ACTUATOR_CONFIGURED=false y HX711_CALIBRATED=false.
++4. Primera instalación: FORMAT_FS_ON_FAILURE=true permite crear LittleFS si no puede montar. Cargar, verificar y volver a false. **No dejar true: un error de montaje podría borrar historial.**
++5. Monitor serie 115200: anotar http://IP. Configurar en Android esa dirección y token. Misma red sin aislamiento de clientes. Puede consultarse conexión antes de calibrar; no permitirá dispensar.
++6. Reservar IP en router si se desea evitar cambios. El Wi-Fi se configura por USB; la app configura IP/token.
+ 
+-En Arduino IDE configura la URL de placas de Espressif:
++HTTP local con token, sin cifrado del transporte. Usar red de confianza; no exponer el puerto 80 a Internet. Acceso remoto requiere diseño seguro adicional.
+ 
+-`https://espressif.github.io/arduino-esp32/package_esp32_index.json`
++## Calibración HX711
++1. Montar tolva vacía, actuador deshabilitado. Promediar 20 lecturas raw estables del monitor y guardar HX711_ZERO.
++2. Añadir masa conocida de 500 o 1000 g y promediar otras 20 lecturas.
++3. Factor = (raw_con_masa − raw_vacío) / gramos_conocidos. Guardar HX711_COUNTS_PER_GRAM. Puede ser negativo, nunca cero.
++4. Activar HX711_CALIBRATED y cargar. Comprobar vacío, 100, 500, 1000 y cerca de 2000 g con patrón externo, registrando errores.
++5. Si no hay estabilidad, corregir estructura/ruido/alimentación. La celda de 10 kg no garantiza precisión para porciones pequeñas. Considerar celda de menor rango que soporte estructura y alimento.
+ 
+-Instala:
++No tarar automáticamente una tolva llena al encender. Capacidad de alimento configurada 2000 g; la capacidad mecánica incluye estructura.
+ 
+-- **esp32 by Espressif Systems: 3.0.7**.
+-- **ArduinoJson by Benoit Blanchon: 6.21.5**.
+-- **HX711 Arduino Library by Bogdan Necula: 0.7.5**.
++## Mecanismo y medición de porciones
++Verificar posiciones de cierre/apertura con tolva vacía y brazo inicialmente desacoplado. Configurar ángulos usando rango de pulsos 1000–2000 μs. Habilitar ACTUATOR_CONFIGURED solo tras comprobar cierre, incluida puesta en marcha.
+ 
+-Selecciona la placa **ESP32 Dev Module** y el puerto USB correspondiente.
+-Abre `firmware/PetBiteESP32/PetBiteESP32.ino`. Config.h aparecerá como otra pestaña.
+-No tienes que copiar los archivos Kotlin al Arduino IDE.
++El firmware exige 1,5 s estable (cambios consecutivos ≤1 g), filtra con factor 0,5, estima inicial−final y cierra anticipadamente con margen inicial 2 g. Cierra por 12 s máximo, 4 s sin flujo, lectura perdida o salto >80 g por muestra. Un aumento >5 g durante entrega provoca fallo. Watchdog independiente por falta de muestras >1,5 s o tiempo máximo. Espera ≥700 ms y estabilidad al cerrar, máximo 5 s; tolerancia inicial ±5 g. Hay 30 s entre operaciones durante el mismo encendido. Son parámetros iniciales, no precisión garantizada.
+ 
+-## A. Probar comunicación sin mover el motor
++Hacer 10 repeticiones por porción elegida. Medir solicitado, pérdida de tolva, peso recibido en balanza externa, error y atascos. Para porciones de 5 g, la tolerancia inicial no es adecuada como garantía de precisión: acordar una tolerancia útil y ajustar mecanismo antes de uso real. No aflojar validaciones para ocultar ruido.
+ 
+-1. En Config.h escribe `WIFI_SSID`, `WIFI_PASSWORD` y una `API_TOKEN` propia de al
+-   menos 8 caracteres. Usa Wi-Fi de 2,4 GHz compatible con tu ESP32.
+-2. Pon `HARDWARE_SIMULATION = true`. El firmware no activa el servo ni requiere
+-   mediciones de sensores en este modo. El reloj sí requiere sincronización NTP.
+-3. Carga el programa y abre el monitor serie a **115200**.
+-4. Espera la dirección, por ejemplo `http://192.168.1.100`.
+-5. En la app desactiva Demo, introduce esa dirección y la misma API_TOKEN, guarda
+-   y prueba la conexión. Inicio indicará **ESP32 en SIMULACIÓN**.
+-6. Solicita una porción. Verás la confirmación de prueba y el registro como simulación.
++Si SG90 no tiene torque o las croquetas traban la salida, cambiar geometría o actuador; no aumentar indefinidamente tiempos. Pérdida de tolva no confirma llegada al plato: alimento puede quedar en conducto. Añadir segunda balanza para confirmar recepción.
+ 
+-Esta prueba comprueba la comunicación; no calibra ni demuestra el mecanismo físico.
++## Horarios, reloj y almacenamiento
++Crear/editar/eliminar en Android y pulsar Enviar horarios al ESP32. Hasta confirmación conserva los anteriores. NTP obtiene hora Lima; después continúa sin Internet mientras siga encendido. Tras corte requiere sincronizar otra vez. Sin NTP no dispensa. Futuro: RTC con batería.
+ 
+-## B. Calibrar HX711
++No recupera comidas pasadas. Marca persistente antes de servir: ante corte puede omitirse la comida, nunca se repite automáticamente. Editar mismo ID conserva marca diaria; borrar/recrear en mismo minuto no repite horario. Nueva orden manual es una nueva decisión explícita.
+ 
+-1. Coloca la balanza bajo el recipiente de alimentación y fija bien su estructura.
+-2. Pon `HARDWARE_SIMULATION = false`, `ACTUATOR_CONFIGURED = false` y
+-   `HX711_CALIBRATED = false`. Carga el programa: no habilitará el servo.
+-3. Observa `HX711 raw` en el monitor. Con el recipiente vacío, espera valores
+-   estables y anota el promedio de varias lecturas: será `HX711_ZERO`.
+-4. Coloca una masa de peso conocido, por ejemplo 100 g, y anota el promedio nuevo.
+-5. Calcula:
+-
+-   `HX711_COUNTS_PER_GRAM = (lectura_con_masa - lectura_vacia) / gramos_conocidos`
+-
+-6. Copia ambos valores en Config.h. El factor puede ser negativo según el cableado.
+-   No uses cero. Pon `HX711_CALIBRATED = true` y vuelve a cargar.
+-7. Comprueba que el recipiente vacío marca cerca de 0 g y la masa conocida marca
+-   su peso. La aplicación no inventa una calibración por ti.
+-
+-No cambies la posición del recipiente ni la fijación después de calibrar. Un animal
+-que empuje o retire el recipiente altera las mediciones; supervisa las primeras pruebas.
+-
+-## C. Configurar la compuerta
+-
+-Con el depósito vacío y el brazo del servo inicialmente desacoplado del mecanismo,
+-verifica el ángulo de cierre de tu montaje. Los valores 0° y 65° son ejemplos y no
+-son necesariamente correctos para tu compuerta. Ajusta:
+-
+-- `SERVO_CLOSED_DEGREES`: posición que deja cerrada la salida.
+-- `SERVO_OPEN_DEGREES`: posición que deja pasar el alimento.
+-- `ACTUATOR_CONFIGURED = true` únicamente cuando el cierre sea correcto.
+-
+-El rango de pulsos inicial es 1000–2000 microsegundos, definido por SERVO_MIN_US y
+-SERVO_MAX_US. Si usas otro programa para medir los ángulos, configúralo con ese mismo
+-rango (por ejemplo, attach(pin, 1000, 2000) si usas una biblioteca Servo).
+-
+-Puedes usar un programa de prueba de servo para identificar los ángulos antes de
+-habilitar el control completo. El programa se coloca en la posición cerrada al arrancar
+-cuando el actuador está habilitado. Una compuerta con retorno mecánico al cierre es
+-preferible para que un corte de alimentación no la deje abierta.
+-
+-Comienza con una pequeña cantidad de alimento y una orden de 5–10 g supervisada.
+-El firmware cierra cerca del objetivo y deja 700 ms para estabilizar el peso final.
+-Ajusta `STOP_MARGIN_GRAMS` según cuánto alimento siga cayendo al cerrar.
+-`MAX_OPEN_MS` limita el tiempo abierto; `NO_FLOW_TIMEOUT_MS` detiene si no aumenta
+-el peso. Existe además una tarea independiente que cierra ante exceso de tiempo o
+-falta de nuevas lecturas, aunque una petición de red esté bloqueada.
+-
+-## D. Calibrar nivel del depósito
+-
+-Mide la distancia entre HC-SR04 y la superficie con depósito lleno y vacío.
+-Pon las medidas en `DISTANCE_FULL_CM` y `DISTANCE_EMPTY_CM`; la segunda debe ser mayor.
+-Activa `LEVEL_CALIBRATED = true`. Sin calibración, la app muestra nivel desconocido,
+-no un porcentaje ficticio. La irregularidad de los granos puede causar variación.
+-
+-## E. Dejarlo listo
+-
+-Comprueba que `HARDWARE_SIMULATION = false`, que la balanza esté calibrada y que el
+-actuador esté configurado. Carga el programa final. En la app prueba conexión, porción,
+-detención, historial y un horario próximo. Luego cierra la app y verifica ese horario.
+-
+-Para los horarios, el ESP32 necesita obtener su hora inicial por Internet (NTP).
+-Si no consigue la hora, la app lo mostrará y no iniciará entregas. Los horarios se
+-conservan al reiniciar, pero el reloj debe sincronizarse de nuevo. No recupera comidas
+-pasadas para evitar servir varias porciones juntas tras un apagón.
+-
+-Reenviar o editar un horario conserva su marca diaria. Si ese horario ya se ejecutó
+-hoy, su modificación comienza a aplicarse al día siguiente. Borrar y crear uno nuevo
+-crea otro identificador: úsalo con cuidado para no programar una comida extra.
+-
+-## Si algo no conecta
+-
+-- IP: utiliza la del monitor serie; puede cambiar al reiniciar el router. Puedes
+-  reservar una IP para el ESP32 desde la configuración del router.
+-- Clave: la de la app debe coincidir exactamente con API_TOKEN.
+-- Wi-Fi: misma red, sin aislamiento entre clientes o red de invitados.
+-- Mensaje «sin calibrar»: revisa los valores y banderas de Config.h; no cambies la app.
+-- «Sin confirmar»: actualiza el historial y revisa el recipiente antes de repetir.
+-- «Detención sin confirmar»: no asumas que la orden llegó; revisa el equipo físicamente.
++Hasta 512 registros LittleFS; si se llena rechaza nuevas entregas sin borrar registros recientes. Retención 7/30 días enviada al conectar: ESP32 limpia cada minuto inactivo con reloj válido; Android al iniciar, sincronizar o cambiar preferencia. Con app cerrada no limpia almacenamiento Android hasta abrir. Perfiles, juego, secuencias y horarios no se borran con historial.
+--- /dev/null
++++ b/docs/DIAGNOSTICO_Y_CAMBIOS.md
+@@ -0,0 +1,38 @@
++# Diagnóstico y cambios de esta entrega
++
++## Estado al recibir el ZIP
++33 archivos: Android Kotlin/Compose/Material 3, AndroidViewModel, StateFlow, Room 2.6.1, SharedPreferences, cliente HttpURLConnection con coroutines; firmware Arduino ESP32, Preferences, ArduinoJson, HX711 y PWM LEDC. AGP 8.7.3, Gradle 8.9, Kotlin 2.0.21, BOM Compose 2024.12.01, SDK 35, mínimo 26, JDK 17.
++
++Se leyeron AGENTE_PETMIN.md y LEEME.md. El primero solicita firmware SG90/tolva y Gaming; el segundo declara una actualización parcial. El informe de verificación antiguo pertenece a PetBite 2.0 y **no demuestra** que esta revisión PetMin compile.
++
++Problemas detectados: medición del plato en lugar de la tolva; GPIO18/HC-SR04 incompatibles con circuito previsto; rama simulada todavía existente en firmware; código de interfaz con condiciones constantes residuales; historial ESP32 de solo 16 registros; deduplicación vinculada a esos registros; ausencia de perfiles y Gaming; documentación mezclada de versiones.
++
++## Reutilización
++Se preservaron proyecto Gradle, paquete Android, tema, navegación y pantallas existentes, entidades Room y esquema, validaciones, cliente HTTP asíncrono, stop, sincronización de horarios y recuperación de operaciones no confirmadas. No se reconstruyó la aplicación desde cero.
++
++## Etapas realizadas
++1. Respaldo ZIP original intacto y diagnóstico. Intento inicial de Gradle: descarga bloqueada por red.
++2. Firmware para pérdida de peso de tolva, SG90 GPIO13, HX711 GPIO32/33, buzzer GPIO25, eliminación de simulación, API 3 y configuración de secretos local.
++3. Secuencia persistente para órdenes manuales, intervalo de espera, peso estable, pérdida de lectura, cambio brusco, tolerancia, reloj y marca de minuto programado. Historial de archivos LittleFS, recuperación, páginas y retención.
++4. Adaptación Android al contrato nuevo, gramos restantes y perfiles en almacenamiento separado.
++5. Escena 3D original nativa, dos mascotas, habitación y animaciones; cinco desafíos persistentes aislados del ESP32.
++6. Pruebas nativas de reglas, ampliación de pruebas HTTP, revisión de fuentes y documentación. Segundo intento de Gradle bloqueado también.
++
++## Decisión 3D
++Godot/Unity agregan exportación, integración y dependencias que no estaban en el ZIP. Para esta primera entrega se utiliza GLSurfaceView/OpenGL ES con geometría prediseñada original de estilo de bloques. Es renderizado tridimensional real con profundidad y cámara, no un video ni una imagen 2D. Es sencillo y no equivale a un modelo escaneado o realista. La UI educativa no depende del renderer: podrá sustituirse por un motor/modelos glTF posteriormente.
++
++## Mapa de código
++- `PetViewModel.kt`: estado IoT, acciones, mensajes y sincronización.
++- `device/FeederApi.kt`: contrato HTTP y manejo de resultados inciertos.
++- `device/Validation.kt`: entradas de usuario.
++- `data/Database.kt`: Room, historial y horarios.
++- `data/Profiles.kt`: perfiles; `data/Settings.kt`: ajustes.
++- `ui/PetApp.kt`, `Profiles.kt`, `GamingScreen.kt`: pantallas.
++- `gaming/PetScene.kt`: renderer y animaciones, sin referencia a IoT.
++- `firmware/PetBiteESP32/`: nombre de carpeta conservado para Arduino; firmware PetMin API 3.
++- `firmware/tests/rules_test.cpp`: reglas puras verificables sin hardware.
++
++## Límites de la arquitectura
++Un dispensador por configuración. Sin backend, acceso remoto, emparejamiento automático ni cifrado HTTP. Los perfiles son registros de referencia, no determinan porciones. El nombre de saludo en Ajustes es independiente del perfil y del nombre virtual. Una mascota virtual activa, progreso único que se conserva al alternar especie. Horarios requieren botón explícito de sincronización; confirmar visualmente después de restaurar/borrar ESP32 porque la marca local de sincronización no detecta un borrado externo.
++
++Respaldo dentro del ZIP final y diferencias en `docs/CAMBIOS.patch`. No se modificaron credenciales reales. La base recibida permanece recuperable.
+--- a/docs/DIARIO_DISENO.md
++++ b/docs/DIARIO_DISENO.md
+@@ -1,18 +1,9 @@
+-# Diario de diseño — PetBite
++# Diario de diseño PetMin 3.0
+ 
+-Este documento acompaña al PPTX `Diario_PetBite_Completado.pptx` y describe las decisiones tomadas para el prototipo. Los resultados de las pruebas de usuario están pendientes de recogida real.
++Flujo físico: Inicio → Porción → Confirmar → orden única → consultar resultado → Historial. Error de red significa resultado incierto; no se reenvía. Horarios: editar local → enviar → ESP32 conserva y ejecuta con reloj válido.
+ 
+-## Funcionalidad principal
+-La persona puede comprobar el nivel de alimento y dispensar una porción configurada en gramos, con confirmación previa. Puede programar horarios diarios y revisar el historial. La app distingue modo demo y ESP32 real.
++Gaming: elegir perro/gato y nombre → escena 3D → cinco desafíos → logros persistentes. Sin conexión al dispensador. Perfiles reales en Ajustes no calculan dieta.
+ 
+-## Flujo
+-Inicio → Porción → Confirmación → Mensaje de resultado → Historial. En caso de desconexión se muestra un aviso y no se afirma que el alimento se entregó. Horarios → Crear/editar → Guardar localmente → Enviar al ESP32.
++Material 3, seis destinos, porcentaje más gramos, mediciones desconocidas explícitas. Calibración guiada en pantalla y aplicada por USB. Sin botones ficticios de escaneo/tienda/nube.
+ 
+-## Tecnologías
+-Kotlin, Jetpack Compose, Material 3, Room, red Wi-Fi local y HTTP con API del ESP32. El permiso de Internet está declarado en AndroidManifest. No usa cámara, ubicación ni Bluetooth.
+-
+-## Accesibilidad
+-Etiquetas para controles de navegación, descripción accesible del nivel de alimento, mensajes textuales para estados, botones grandes, contraste claro/oscuro y valores en gramos explícitos.
+-
+-## Evaluación pendiente
+-Probar con tres personas, registrar tiempo y dificultades sin guiarlas y elegir tres mejoras basadas en sus observaciones. No presentar datos inventados como pruebas reales.
++Pendiente: observar a tres usuarios reales, registrar dificultades y corregir las tres principales. No se inventaron entrevistas ni tiempos.
+--- /dev/null
++++ b/docs/PLAN_3_SEMANAS.md
+@@ -0,0 +1,25 @@
++# Plan para cuatro integrantes — tres semanas
++
++Trabajar con un bloque de 60–90 minutos, cinco días por semana, y una sesión grupal de integración de 90 minutos. Presupuesto orientativo: 6,5–9 horas por persona/semana, compatible con reservar tiempo para otros cursos. Comprar/fabricar mecanismo y resolver problemas de hardware puede requerir tiempo adicional. Congelar funciones nuevas al finalizar el día 14.
++
++| Responsable | Área principal | Evidencia |
++|---|---|---|
++| Integrante 1 | Android, compilación, conexión y UI | APK instalado, navegación y errores reales |
++| Integrante 2 | Circuito, mecanismo, firmware y calibración | Tabla de masas, cierre seguro y porciones pesadas |
++| Integrante 3 | Gaming, perfiles y recursos visuales | Dos mascotas, animaciones y cinco logros persistentes |
++| Integrante 4 | Integración, pruebas, documentación e historial | Casos reproducibles, errores y presentación |
++
++| Días | Trabajo y criterio de salida |
++|---|---|
++| 1–2 | Todos abren mismo ZIP; I1 compila Android, I2 compila ESP32 con servo deshabilitado, I3 revisa escena y fotos, I4 registra versiones/errores. No avanzar sin identificar los bloqueos de compilación. |
++| 3–4 | I1/I2 conexión real y estado sin actuador; I2 verifica alimentación/tara; I3 revisa desafíos y legibilidad; I4 valida contrato y documenta montaje. |
++| 5–7 | Calibración de varias masas y prueba supervisada de cierre. Primera porción medida, paro y pérdida de red. Meta: flujo Android→ESP32→historial comprobado. Si falla SG90, corregir mecanismo ahora. |
++| 8–10 | Horarios con app cerrada, reinicio y sin NTP; historial/paginación/retención; edición de perfiles y foto. Gaming y progreso tras cerrar la app. |
++| 11–13 | Series de 10 porciones; comparar pérdida de tolva con balanza externa. Probar atasco, sensor desconectado y reinicio durante entrega, con supervisión y cierre mecánico. |
++| 14 | Congelar funciones; aceptar solo lo demostrado. Si precisión insuficiente, documentar rango usable y corrección de mecanismo, sin inventar resultados. |
++| 15–17 | Corregir fallos; comprobar accesibilidad/rotación/pantalla pequeña y rendimiento. Ejecutar suite Android y compilar firmware final. |
++| 18–19 | Generar APK, verificar instalación limpia y actualización, preparar guía y evidencias reales. |
++| 20 | Ensayo de 8–10 minutos: conexión, lectura, porción, horario, historial, perfil y Gaming. Cada integrante explica su módulo. |
++| 21 | Margen para fallos, empaquetado de código sin secretos, entrega y respaldo. |
++
++Reunión breve: qué funciona, qué bloquea y siguiente prueba. Compartir cambios con Git en ramas android/hardware/gaming/datos al trabajar en sus equipos, revisar antes de fusionar. No dejar calibración y montaje para la semana final. Escaneo de mascotas, tienda y nube quedan fuera de estas tres semanas.
+--- /dev/null
++++ b/docs/RECURSOS_Y_FUTURO.md
+@@ -0,0 +1,22 @@
++# Recursos, referencias y ampliaciones
++
++## Recursos 3D
++`gaming/PetScene.kt` define geometría procedural original prediseñada de perro y gato, habitación y animaciones. No descarga ni incorpora modelos ajenos. La geometría y animaciones originales incluidas pueden reutilizarse bajo CC0-1.0 (https://creativecommons.org/publicdomain/zero/1.0/); esto no cambia las licencias de Android, dependencias o código heredado. Iconos proceden de Material Icons mediante dependencia existente. Las fotos las selecciona el usuario.
++
++Se conserva Gradle/GRADLE_LICENSE.txt. Dependencias de terceros mantienen sus respectivas licencias; no se empaquetan binarios adicionales ni activos de procedencia desconocida.
++
++## Referencias consultadas
++- Android GLSurfaceView/OpenGL ES: https://developer.android.com/develop/ui/views/graphics/opengl/environment
++- Ciclo de vida del renderer: https://developer.android.com/reference/android/opengl/GLSurfaceView
++- HX711 biblioteca y lectura: https://github.com/bogde/HX711
++- Contenido educativo, ASPCA: https://www.aspca.org/pet-care/aspca-poison-control/people-foods-avoid-feeding-your-pets
++
++Los desafíos contienen paráfrasis breves y no calculan raciones veterinarias. Uvas/pasas se presentan específicamente como riesgo documentado en perros; el juego promueve mantenerlas alejadas de mascotas, sin afirmar una dosis segura en gatos.
++
++## Extensiones posteriores
++- Renderer separado permite sustituir geometría por glTF o motor 3D sin modificar cliente IoT.
++- Almacén `petmin_gaming` independiente permite migrar logros, monedas y niveles sin tocar Room de alimentación.
++- Perfiles con UUID permiten más mascotas, selección activa y futuras asociaciones con horarios.
++- Escaneo/fotogrametría requiere captura multivista, procesamiento/modelado y revisión de privacidad/licencias: no es un botón de cámara que genere automáticamente un avatar fiable.
++- Nube requiere autenticación y transporte seguro. Nunca introducir llamadas a dispensador desde acciones del juego.
++- RTC con batería permitiría recuperar hora sin Internet; segunda balanza permitiría contrastar recepción en plato.
+--- a/docs/VERIFICACION.md
++++ b/docs/VERIFICACION.md
+@@ -1,45 +1,39 @@
+-# Verificación de PetBite 2.0
++# Verificación PetMin 3.0 — 12/10/2026
+ 
+-Fecha de la entrega: 9 de octubre de 2026 (Perú).
++Reemplaza informe de PetBite 2.0: no transfiere sus resultados a esta revisión.
+ 
+-## Android
++| Comprobación | Resultado real |
++|---|---|
++| Inspección de código/ZIP | Realizada |
++| Reglas C++ con g++ -std=c++17 -Wall -Wextra -Werror | Compiladas y ejecutadas con aserciones activas, exit 0 |
++| Android testDebugUnitTest + assembleDebug | Intentados, bloqueo al descargar Gradle 8.9: Network is unreachable |
++| Suite HTTP/JUnit actualizada | NO ejecutada por bloqueo Gradle |
++| Firmware completo ESP32 | NO compilado; herramientas/core/bibliotecas no disponibles |
++| UI, teléfono/emulador y OpenGL | NO ejecutados |
++| Hardware, flash, red y dosificación | NO probados |
++| APK | NO generado ni verificado |
+ 
+-- `:app:assembleDebug`: **BUILD SUCCESSFUL**, APK 2.0.0, versionCode 2.
+-- `:app:testDebugUnitTest`: **15 pruebas aprobadas, 0 fallos y 0 errores**.
+-- 4 pruebas de límites de porción, hora y validación de direcciones.
+-- 11 pruebas del cliente contra un servidor HTTP simulado: envío único de orden,
+-  consultas asíncronas, timeout sin reenviar, ID incorrecto, rechazo explícito,
+-  entrega fallida, nivel desconocido, historial autónomo/reinicio, sustitución de
+-  horarios, guardado sin confirmar y detención confirmada o no confirmada.
+-- Firma del APK verificada. Paquete `com.yuri.petbite`, mínimo Android 8 / API 26.
+-- JDK 17, SDK 35, AGP 8.7.3, Gradle 8.9 y Kotlin 2.0.21.
++Logs: pruebas/gradle.txt y pruebas/reglas.txt. Reglas nativas no compilan sketch ni verifican sensores, concurrencia o hardware.
+ 
+-## ESP32
++## Reproducir
++Con JDK 17, SDK 35 y red: `gradlew.bat testDebugUnitTest assembleDebug`. Ver app/build/test-results/testDebugUnitTest/. APK esperado en app/build/outputs/apk/debug/app-debug.apk. Instalar Android 8+. Si firma difiere de una instalación previa no se puede actualizar directamente; respaldar antes de desinstalar.
++Firmware: Arduino IDE Verificar con herramientas indicadas en CONFIGURAR_ESP32.md.
++Reglas: `g++ -std=c++17 -Wall -Wextra -Werror firmware/tests/rules_test.cpp -o rules_test` y ejecutar binario.
+ 
+-- Programa completo compilado para **esp32:esp32:esp32 (ESP32 Dev Module)**.
+-- Core Espressif 3.0.7, ArduinoJson 6.21.5 y HX711 Arduino Library 0.7.5.
+-- Resultado final: **982565 bytes (74%)** de programa, **46000 bytes (14%)** de
+-  variables globales. Cabe en la configuración de placa utilizada.
+-- Reglas C++ comprobadas con aserciones nativas: límites de porción/hora, ejecución
+-  diaria sin repetir el mismo día y cierre por objetivo, límite de tiempo, peso
+-  negativo o lectura no válida.
++## Aceptación física y Android pendiente
++Registrar fecha, responsable, esperado y observado, sin inventar evidencias:
++- IP/token incorrectos, ESP32 apagado: error sin declarar entrega.
++- Sin calibrar: conectado pero bloqueado; sin medición ficticia.
++- Pesos patrón y 10 porciones por tamaño: comparar tolva y balanza externa.
++- Doble toque, replay mismo ID/secuencia, replay tras >16 eventos y reinicio: no duplicar.
++- Dos teléfonos: solo uno obtiene la secuencia.
++- Desconectar sensor, atascar con supervisión, mover/recargar tolva: cierre y fallo.
++- Paro, red perdida y corte eléctrico: no repetir automáticamente; cierre mecánico probado.
++- Horario con app cerrada; reinicio sin NTP: no recuperar comidas atrasadas.
++- Editar/borrar/reenviar mismo minuto: no duplicar.
++- Retención 7/30, 512 registros y flash llena: conservar perfiles/logros; bloqueo seguro por capacidad.
++- Perfil/foto y reinicio Android: datos accesibles, errores de imagen manejados.
++- Gaming: perro/gato, giro, reposo/alegría/comida, cinco desafíos, progreso 0–100 guardado; cero llamadas IoT.
++- Pantalla pequeña/rotación/teclado/segundo plano: usable y renderer pausado.
+ 
+-## Qué significa esta verificación
+-
+-Se verificaron compilación y comportamiento del cliente HTTP mediante simulación.
+-Las pruebas del servidor simulado no ejecutan el ESP32 físico ni demuestran el
+-comportamiento de sus sensores, memoria bajo cortes de energía o mecanismo.
+-
+-No se ejecutó la interfaz en un teléfono/emulador durante esta entrega, ni se probó
+-una dispensación con tu circuito. Debes configurar el hardware, calibrarlo y hacer
+-una prueba supervisada. La lógica de control está implementada, pero una cantidad
+-en gramos no puede garantizarse sin medir y ajustar el montaje real.
+-
+-Los valores de Config.h son plantillas deliberadas: no son mediciones de tu equipo.
+-No se incluyó un binario ESP32 listo para cargar con credenciales genéricas; debes
+-editar Config.h y compilar/cargar el sketch desde Arduino IDE.
+-
+-Consulta LEEME.md si ya instalaste el APK anterior: la nueva firma de depuración
+-requiere desinstalar ese APK antes de instalar este y eso elimina sus datos locales.
+-
+-SHA-256 del APK: `c96f9cb673b3317bc93a3cc2b9d3385036a5a0427e592e5e0bd7d59d7b13060b`
++Antes de uso autónomo verificar circuito, mecanismo y todas las protecciones. Código implementado no equivale a dosificación validada.
+--- /dev/null
++++ b/docs/pruebas/gradle.txt
+@@ -0,0 +1,28 @@
++Downloading https://services.gradle.org/distributions/gradle-8.9-bin.zip
++
++Exception in thread "main" java.net.SocketException: Network is unreachable
++	at java.base/sun.nio.ch.Net.connect0(Native Method)
++	at java.base/sun.nio.ch.Net.connect(Net.java:591)
++	at java.base/sun.nio.ch.Net.connect(Net.java:580)
++	at java.base/sun.nio.ch.NioSocketImpl.connect(NioSocketImpl.java:593)
++	at java.base/java.net.Socket.connect(Socket.java:633)
++	at java.base/sun.net.NetworkClient.doConnect(NetworkClient.java:178)
++	at java.base/sun.net.www.http.HttpClient.openServer(HttpClient.java:533)
++	at java.base/sun.net.www.http.HttpClient$1.run(HttpClient.java:592)
++	at java.base/sun.net.www.http.HttpClient$1.run(HttpClient.java:590)
++	at java.base/java.security.AccessController.doPrivileged(AccessController.java:569)
++	at java.base/sun.net.www.http.HttpClient.privilegedOpenServer(HttpClient.java:589)
++	at java.base/sun.net.www.http.HttpClient.openServer(HttpClient.java:633)
++	at java.base/sun.net.www.protocol.https.HttpsClient.<init>(HttpsClient.java:267)
++	at java.base/sun.net.www.protocol.https.HttpsClient.New(HttpsClient.java:381)
++	at java.base/sun.net.www.protocol.https.AbstractDelegateHttpsURLConnection.getNewHttpClient(AbstractDelegateHttpsURLConnection.java:205)
++	at java.base/sun.net.www.protocol.http.HttpURLConnection.plainConnect0(HttpURLConnection.java:1283)
++	at java.base/sun.net.www.protocol.http.HttpURLConnection.plainConnect(HttpURLConnection.java:1148)
++	at java.base/sun.net.www.protocol.http.HttpURLConnection.connect(HttpURLConnection.java:1077)
++	at java.base/sun.net.www.protocol.https.AbstractDelegateHttpsURLConnection.connect(AbstractDelegateHttpsURLConnection.java:181)
++	at java.base/sun.net.www.protocol.http.HttpURLConnection.getInputStream0(HttpURLConnection.java:1717)
++	at java.base/sun.net.www.protocol.http.HttpURLConnection.getInputStream(HttpURLConnection.java:1641)
++	at java.base/sun.net.www.protocol.https.HttpsURLConnectionImpl.getInputStream(HttpsURLConnectionImpl.java:224)
++	at org.gradle.wrapper.Install.forceFetch(SourceFile:2)
++	at org.gradle.wrapper.Install$1.call(SourceFile:8)
++	at org.gradle.wrapper.GradleWrapperMain.main(SourceFile:67)
+--- /dev/null
++++ b/docs/pruebas/reglas.txt
+@@ -0,0 +1,3 @@
++12/10/2026: g++ -std=c++17 -Wall -Wextra -Werror firmware/tests/rules_test.cpp
++Compilacion exit 0. Ejecucion exit 0. 19 aserciones activas.
++No compila firmware completo ni prueba hardware.
+--- /dev/null
++++ b/docs/pruebas/revision_estatica.txt
+@@ -0,0 +1,4 @@
++API 3 presente en Android y firmware; seis rutas cotejadas.
++Firmware sin simulacion ni HC-SR04. Cinco desafios; Gaming sin import del cliente IoT.
++19 metodos JUnit declarados, no ejecutados. No Secrets.h en entrega.
++Documentacion actual comprobada despues de corregir fechas futuras del ZIP recibido.
+--- a/firmware/PetBiteESP32/Config.h
++++ b/firmware/PetBiteESP32/Config.h
+@@ -1,38 +1,27 @@
+ #pragma once
+-// Configura estos valores antes de cargar el ESP32 DevKit V1 (ESP32 clásico).
+-constexpr char WIFI_SSID[] = "TU_WIFI";
+-constexpr char WIFI_PASSWORD[] = "TU_CLAVE_WIFI";
+-// Usa la misma clave en Ajustes de la app. Cambia este ejemplo (mínimo 8 caracteres).
+-constexpr char API_TOKEN[] = "CAMBIA_ESTA_CLAVE";
+-
+-// Pines propuestos; cámbialos si tu cableado es diferente.
+-constexpr int SERVO_PIN = 18;
++// PETMIN HARDWARE: ESP32 clásico. Nunca guardar credenciales reales en Git.
++#if __has_include("Secrets.h")
++#include "Secrets.h"
++#else
++constexpr char WIFI_SSID[] = "";
++constexpr char WIFI_PASSWORD[] = "";
++constexpr char API_TOKEN[] = "";
++#endif
++constexpr int SERVO_PIN = 13;
+ constexpr int HX711_DATA_PIN = 32;
+ constexpr int HX711_CLOCK_PIN = 33;
+-constexpr int ULTRASONIC_TRIG_PIN = 26;
+-constexpr int ULTRASONIC_ECHO_PIN = 27; // ECHO con divisor de tensión a 3,3 V.
++constexpr int BUZZER_PIN = 25; // Buzzer activo mediante transistor si supera corriente del GPIO.
++constexpr bool ACTUATOR_CONFIGURED = false;
++constexpr int SERVO_MIN_US = 1000, SERVO_MAX_US = 2000;
++constexpr int SERVO_CLOSED_DEGREES = 0, SERVO_OPEN_DEGREES = 65;
++constexpr unsigned long MAX_OPEN_MS = 12000, NO_FLOW_TIMEOUT_MS = 4000;
++constexpr float STOP_MARGIN_GRAMS = 2.0f;
++constexpr float CAPACITY_GRAMS = 2000.0f;
++constexpr float MAX_TOLERANCE_GRAMS = 5.0f;
++// PETMIN HARDWARE: tara con tolva vacía montada; factor puede ser negativo.
++constexpr bool HX711_CALIBRATED = false;
++constexpr long HX711_ZERO = 0;
++constexpr float HX711_COUNTS_PER_GRAM = 1.0f;
+ 
+-// No habilites el actuador hasta comprobar sus posiciones con el mecanismo vacío.
+-constexpr bool ACTUATOR_CONFIGURED = false;
+-// Rango inicial conservador de pulsos; usa el mismo rango en cualquier prueba de angulos.
+-constexpr int SERVO_MIN_US = 1000;
+-constexpr int SERVO_MAX_US = 2000;
+-constexpr int SERVO_CLOSED_DEGREES = 0;
+-constexpr int SERVO_OPEN_DEGREES = 65;
+-constexpr unsigned long MAX_OPEN_MS = 12000;
+-constexpr unsigned long NO_FLOW_TIMEOUT_MS = 4000;
+-constexpr float STOP_MARGIN_GRAMS = 2.0f;
+-
+-// Balanza debajo del recipiente. Lee el monitor serie para calcular estos valores.
+-constexpr bool HX711_CALIBRATED = false;
+-constexpr long HX711_ZERO = 0;           // Lectura cruda con recipiente vacío.
+-constexpr float HX711_COUNTS_PER_GRAM = 1.0f; // (lectura con masa - lectura vacía) / gramos.
+-constexpr float MAX_BOWL_GRAMS = 4500.0f;
+-
+-// Distancia del HC-SR04 a la superficie del alimento, medidas reales del depósito.
+-constexpr bool LEVEL_CALIBRATED = false;
+-constexpr float DISTANCE_FULL_CM = 4.0f;
+-constexpr float DISTANCE_EMPTY_CM = 25.0f;
+-
+-// Solo para verificar comunicación sin motores ni sensores. La app lo muestra como SIMULACIÓN.
+-constexpr bool HARDWARE_SIMULATION = false; // PETMIN: mantener false en producción; verificar servo y HX711 antes de operar.
++// Solo primera instalación: true permite formatear si no puede montar. Volver a false.
++constexpr bool FORMAT_FS_ON_FAILURE = false;
+--- a/firmware/PetBiteESP32/PetBiteESP32.ino
++++ b/firmware/PetBiteESP32/PetBiteESP32.ino
+@@ -4,6 +4,7 @@
+ #include <Preferences.h>
+ #include <ArduinoJson.h>
+ #include <HX711.h>
++#include <LittleFS.h>
+ #include <time.h>
+ #include <atomic>
+ #include <esp_arduino_version.h>
+@@ -19,11 +20,20 @@
+ const char* headerKeys[] = {"Authorization"};
+ String deviceId;
+ bool storageReady = false, servoReady = false, clockValid = false;
+-float bowlGrams = NAN, lastGain = NAN;
++float hopperGrams = NAN, lastGain = NAN;
+ long rawScale = 0;
+ int levelPercent = -1;
+ unsigned long lastScaleMs = 0, lastLevelMs = 0, lastWiFiMs = 0, lastPrintMs = 0;
+ String activeId;
++uint64_t lastSequence = 0;
++unsigned long lastFinishedMs = 0;
++unsigned long stableSince = 0, lastCleanupMs = 0;
++float previousSample = NAN;
++bool sensorJump = false;
++int retentionDays = 30;
++uint64_t lastScheduleMinute = 0;
++constexpr int MAX_ARCHIVE_EVENTS = 512;
++
+ float baseline = 0, progressWeight = 0;
+ unsigned long startedMs = 0, lastProgressMs = 0, settlingMs = 0;
+ int targetGrams = 0;
+@@ -37,6 +47,31 @@
+ JsonArray eventsArray() { return history.as<JsonArray>(); }
+ JsonArray scheduleArray() { return timetable.as<JsonArray>(); }
+ 
++// PETMIN NOTA: archivo por orden, reemplazo temporal; NVS conserva además las últimas 16.
++// LittleFS es persistente y limita uso de RAM a una página de 32 registros.
++bool archiveEvent(JsonObject event) {
++    String path = "/events/" + event["requestId"].as<String>() + ".json";
++    File file = LittleFS.open("/event.tmp", "w");
++    if (!file) return false;
++    size_t expected = measureJson(event);
++    size_t written = serializeJson(event, file); file.flush(); file.close();
++    return written == expected && LittleFS.rename("/event.tmp", path);
++}
++int archiveCount() {
++    File root = LittleFS.open("/events"); int count = 0;
++    for (File f = root.openNextFile(); f; f = root.openNextFile()) { count++; f.close(); }
++    return count;
++}
++void pruneArchive() {
++    if (!clockValid || active() || !storageReady) return;
++    File root = LittleFS.open("/events");
++    long long cutoff = epochMs() - retentionDays * 86400000LL;
++    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
++        String path = f.path(); StaticJsonDocument<1024> item;
++        bool parsed = !deserializeJson(item, f); f.close();
++        if (parsed && item["timestamp"].as<long long>() < cutoff) LittleFS.remove(path);
++    }
++}
+ bool persistHistory() {
+     String value; serializeJson(history, value);
+     return storageReady && prefs.putBytes("events", value.c_str(), value.length()) == value.length();
+@@ -61,7 +96,7 @@
+     return JsonObject();
+ }
+ void writeAngle(int degrees) {
+-    if (!servoReady || HARDWARE_SIMULATION) return;
++    if (!servoReady) return;
+     const uint32_t micros = SERVO_MIN_US + constrain(degrees, 0, 180) * (SERVO_MAX_US - SERVO_MIN_US) / 180;
+     const uint32_t duty = micros * 65535UL / 20000UL;
+ #if ESP_ARDUINO_VERSION_MAJOR >= 3
+@@ -80,15 +115,17 @@
+         vTaskDelay(pdMS_TO_TICKS(20));
+     }
+ }
+-bool scaleHealthy() { return HARDWARE_SIMULATION || (HX711_CALIBRATED && isfinite(bowlGrams) && millis() - lastScaleMs < 1200); }
++bool scaleHealthy() { return (HX711_CALIBRATED && isfinite(hopperGrams) && millis() - lastScaleMs < 1200); }
+ String notReady() {
+     if (!storageReady) return "No se pudo abrir la memoria persistente del ESP32.";
+     if (!clockValid) return "Esperando hora por Internet (NTP); revisa el Wi-Fi.";
+     if (active()) return "Dispensador ocupado.";
+-    if (!HARDWARE_SIMULATION && (!ACTUATOR_CONFIGURED || !servoReady)) return "Configura los pines y angulos del servo en Config.h.";
+-    if (!HARDWARE_SIMULATION && (!HX711_CALIBRATED || !isfinite(HX711_COUNTS_PER_GRAM) || fabs(HX711_COUNTS_PER_GRAM) < 0.001f)) return "Falta calibrar HX711 en Config.h.";
++    if (lastFinishedMs && millis() - lastFinishedMs < 30000) return "Espera 30 segundos entre porciones.";
++    if ((!ACTUATOR_CONFIGURED || !servoReady)) return "Configura los pines y angulos del servo en Config.h.";
++    if ((!HX711_CALIBRATED || !isfinite(HX711_COUNTS_PER_GRAM) || fabs(HX711_COUNTS_PER_GRAM) < 0.001f)) return "Falta calibrar HX711 en Config.h.";
+     if (!scaleHealthy()) return "Sin lectura de la balanza. Revisa HX711.";
+-    if (!HARDWARE_SIMULATION && (bowlGrams < -10 || bowlGrams > MAX_BOWL_GRAMS)) return "Peso del recipiente fuera de rango; revisa la calibracion.";
++    if (!stableSince || millis() - stableSince < 1500) return "Esperando peso estable de la tolva.";
++    if (!petbite::weightInRange(hopperGrams, CAPACITY_GRAMS)) return "Peso de la tolva fuera de rango; revisa la calibracion.";
+     return "";
+ }
+ void respond(int code, JsonVariantConst value) {
+@@ -115,20 +152,22 @@
+ }
+ bool beginMeal(const String& id, int grams, const String& source) {
+     if (!notReady().isEmpty() || !petbite::validPortion(grams)) return false;
+-    if (!HARDWARE_SIMULATION && bowlGrams + grams > MAX_BOWL_GRAMS) return false;
+-    if (eventsArray().size() >= MAX_EVENTS) eventsArray().remove(0);
++    if (hopperGrams < grams + STOP_MARGIN_GRAMS) return false;
++    if (archiveCount() >= MAX_ARCHIVE_EVENTS) return false;
++    if (eventsArray().size() >= MAX_EVENTS) { eventsArray().remove(0); history.garbageCollect(); }
+     JsonObject event = eventsArray().createNestedObject();
+     event["requestId"] = id; event["grams"] = grams; event["timestamp"] = epochMs();
+     event["source"] = source; event["status"] = "accepted"; event["dispensedGrams"] = nullptr;
+-    event["detail"] = ""; event["simulation"] = HARDWARE_SIMULATION;
++    event["detail"] = ""; event["simulation"] = false;
+     // Escribir ANTES de mover: un reinicio no debe repetir una orden pendiente.
+-    if (!persistHistory()) { event["status"] = "failed"; event["detail"] = "No se pudo guardar la orden."; return false; }
+-    activeId = id; targetGrams = grams; baseline = HARDWARE_SIMULATION ? 0 : bowlGrams;
+-    progressWeight = 0; startedMs = lastProgressMs = millis(); settlingMs = 0; outcome = "";
++    if (!archiveEvent(event) || !persistHistory()) { storageReady = false; event["status"] = "failed"; event["detail"] = "No se pudo guardar la orden."; return false; }
++    if (!scaleHealthy()) { event["status"] = "failed"; event["detail"] = "Lectura vencida antes de abrir."; if (!archiveEvent(event) || !persistHistory()) storageReady = false; return false; }
++    activeId = id; targetGrams = grams; baseline = hopperGrams;
++    sensorJump = false; progressWeight = 0; startedMs = lastProgressMs = millis(); settlingMs = 0; outcome = "";
+     event["status"] = "dispensing";
+     emergencyClosed.store(false); watchdogStarted.store(millis());
++    watchdogArmed.store(true);
+     writeAngle(SERVO_OPEN_DEGREES); gateOpen = true;
+-    watchdogArmed.store(!HARDWARE_SIMULATION);
+     return true;
+ }
+ void finishMeal(const String& state, const String& detail, float gain) {
+@@ -137,22 +176,21 @@
+     event["status"] = state; event["detail"] = detail;
+     if (isfinite(gain) && gain >= 0) event["dispensedGrams"] = gain; else event["dispensedGrams"] = nullptr;
+     if (state == "completed") lastGain = gain;
+-    if (!persistHistory()) {
++    if (!archiveEvent(event) || !persistHistory()) {
++        storageReady = false;
+         // La orden aceptada persistida se recuperara como interrumpida al reiniciar.
+         event["status"] = "interrupted"; event["detail"] = "Error de memoria al guardar el resultado. Revisa el recipiente.";
+     }
+-    activeId = ""; settlingMs = 0;
++    activeId = ""; settlingMs = 0; lastFinishedMs = millis();
+ }
+ void serviceMeal() {
+     if (!active()) return;
+     if (emergencyClosed.exchange(false)) { finishMeal("failed", "Cierre de proteccion por tiempo o falta de lectura.", NAN); return; }
+-    if (HARDWARE_SIMULATION) {
+-        if (millis() - startedMs >= 1500) finishMeal("completed", "Prueba del firmware sin actuador.", targetGrams);
+-        return;
+-    }
+     if (!scaleHealthy()) { finishMeal("failed", "Se perdio la lectura de la balanza; compuerta cerrada.", NAN); return; }
+-    float gain = bowlGrams - baseline;
+-    if (gain < -5) { finishMeal("failed", "Se retiro o movio el recipiente; compuerta cerrada.", NAN); return; }
++    if (sensorJump) { finishMeal("failed", "Cambio brusco de peso; revisar fijacion de tolva.", NAN); return; }
++    float gain = petbite::hopperLoss(baseline, hopperGrams);
++    if (!gateOpen && settlingMs && millis() - settlingMs > 5000) { finishMeal("failed", "Peso final inestable.", NAN); return; }
++    if (gain < -5) { finishMeal("failed", "Se recargo o movio la tolva; compuerta cerrada.", NAN); return; }
+     if (gateOpen) {
+         if (gain > progressWeight + 0.5f) { progressWeight = gain; lastProgressMs = millis(); }
+         if (millis() - lastProgressMs >= NO_FLOW_TIMEOUT_MS) { finishMeal("failed", "No se detecta flujo de alimento. Revisa deposito y compuerta.", max(0.0f, gain)); return; }
+@@ -160,45 +198,59 @@
+             outcome = gain >= targetGrams - STOP_MARGIN_GRAMS ? "completed" : "failed";
+             closeGate(); settlingMs = millis();
+         }
+-    } else if (settlingMs && millis() - settlingMs >= 700) {
+-        finishMeal(outcome, outcome == "failed" ? "Se alcanzo el tiempo limite. Porcion incompleta." : "", max(0.0f, gain));
++    } else if (settlingMs && millis() - settlingMs >= 700 && stableSince && millis() - stableSince >= 500) {
++        if (!petbite::withinTolerance(gain, targetGrams, MAX_TOLERANCE_GRAMS)) outcome = "failed";
++        finishMeal(outcome, outcome == "failed" ? "Porcion fuera de tolerancia o tiempo limite; revisar mecanismo." : "", max(0.0f, gain));
+     }
+ }
+ void sampleSensors() {
+-    if (HARDWARE_SIMULATION) { bowlGrams = 0; lastScaleMs = millis(); levelPercent = 75; return; }
+     if (scale.is_ready()) {
+         rawScale = scale.read();
+         float value = (static_cast<float>(rawScale) - HX711_ZERO) / HX711_COUNTS_PER_GRAM;
+-        if (isfinite(value)) { bowlGrams = value; lastScaleMs = millis(); scaleHeartbeat.store(lastScaleMs); }
+-    }
+-    // No bloquear la supervision del servo con mediciones ultrasonicas mientras sirve.
+-    if (!active() && millis() - lastLevelMs >= 3000) {
+-        lastLevelMs = millis();
+-        digitalWrite(ULTRASONIC_TRIG_PIN, LOW); delayMicroseconds(2);
+-        digitalWrite(ULTRASONIC_TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+-        unsigned long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 25000);
+-        float distance = duration * 0.0343f / 2.0f;
+-        if (LEVEL_CALIBRATED && duration > 0 && DISTANCE_EMPTY_CM > DISTANCE_FULL_CM)
+-            levelPercent = constrain(static_cast<int>(roundf(100 * (DISTANCE_EMPTY_CM - distance) / (DISTANCE_EMPTY_CM - DISTANCE_FULL_CM))), 0, 100);
+-        else levelPercent = -1;
+-    }
++        if (isfinite(value) && rawScale != 8388607 && rawScale != -8388608) {
++            if (isfinite(previousSample) && fabs(value - previousSample) > 80.0f && active()) sensorJump = true;
++            if (!isfinite(previousSample) || fabs(value - previousSample) > 1.0f) stableSince = 0;
++            else if (!stableSince) stableSince = millis();
++            previousSample = value;
++            // PETMIN NOTA: filtro corto, sin promedios bloqueantes que retrasen el cierre.
++            hopperGrams = isfinite(hopperGrams) ? hopperGrams * 0.5f + value * 0.5f : value;
++            lastScaleMs = millis(); scaleHeartbeat.store(lastScaleMs);
++        }
++    }
++    levelPercent = scaleHealthy() ? constrain(static_cast<int>(roundf(100 * hopperGrams / CAPACITY_GRAMS)), 0, 100) : -1;
++    digitalWrite(BUZZER_PIN, levelPercent >= 0 && levelPercent < 20 && millis() % 30000 < 200 ? HIGH : LOW);
+     if (!active() && millis() - lastPrintMs >= 2000) {
+         lastPrintMs = millis();
+         if (lastScaleMs == 0 || millis() - lastScaleMs > 1200) Serial.println("HX711 SIN LECTURA: revisa alimentacion y pines.");
+-        else Serial.printf("HX711 raw=%ld; g=%.2f; nivel=%d%%\n", rawScale, bowlGrams, levelPercent);
++        else Serial.printf("HX711 raw=%ld; g=%.2f; nivel=%d%%\n", rawScale, hopperGrams, levelPercent);
+     }
+ }
+ void serviceSchedules() {
+-    if (!clockValid || active() || !notReady().isEmpty()) return;
++    if (!clockValid || active() || !storageReady) return;
+     time_t now = time(nullptr); struct tm local; localtime_r(&now, &local);
++    uint64_t minuteKey = static_cast<uint64_t>(now) / 60;
++    if (minuteKey <= lastScheduleMinute) return;
+     int day = (local.tm_year + 1900) * 10000 + (local.tm_mon + 1) * 100 + local.tm_mday;
+     for (JsonObject item : scheduleArray()) {
+         if (!petbite::due(item["enabled"], item["hour"], item["minute"], local.tm_hour, local.tm_min, item["lastDay"] | 0, day)) continue;
+         // Registrar antes de servir; editar o reenviar no borra la marca diaria.
+         item["lastDay"] = day;
+-        if (!persistSchedules()) return;
++        // PETMIN SEGURIDAD: borrar/recrear un horario en el mismo minuto no repite comida.
++        if (prefs.putULong64("lastMinute", minuteKey) != sizeof(uint64_t) || !persistSchedules()) { storageReady = false; return; }
++        lastScheduleMinute = minuteKey;
+         String id = "s-" + deviceId + "-" + item["id"].as<String>() + "-" + String(day);
+-        if (findEvent(id).isNull()) beginMeal(id, item["grams"], "schedule");
++        if (findEvent(id).isNull() && !beginMeal(id, item["grams"], "schedule") && storageReady) {
++            // Registrar una comida omitida; nunca recuperarla sirviendo otra después.
++            if (archiveCount() < MAX_ARCHIVE_EVENTS) {
++                if (eventsArray().size() >= MAX_EVENTS) { eventsArray().remove(0); history.garbageCollect(); }
++                JsonObject missed = findEvent(id); if (missed.isNull()) missed = eventsArray().createNestedObject();
++                missed["requestId"] = id; missed["timestamp"] = epochMs(); missed["grams"] = item["grams"];
++                missed["source"] = "schedule"; missed["status"] = "failed"; missed["dispensedGrams"] = nullptr;
++                missed["simulation"] = false;
++                String reason = notReady(); missed["detail"] = reason.isEmpty() ? "Alimento insuficiente o memoria llena." : reason;
++                if (!archiveEvent(missed) || !persistHistory()) storageReady = false;
++            }
++        }
+         break;
+     }
+ }
+@@ -206,17 +258,44 @@
+     server.collectHeaders(headerKeys, 1);
+     server.on("/api/status", HTTP_GET, [] {
+         if (!authorize()) return;
+-        StaticJsonDocument<768> json;
+-        json["apiVersion"] = 2; json["online"] = true; json["deviceId"] = deviceId;
+-        json["simulation"] = HARDWARE_SIMULATION; json["busy"] = active(); json["clockSynced"] = clockValid;
+-        String reason = notReady(); json["ready"] = reason.isEmpty(); json["message"] = reason;
++        StaticJsonDocument<1024> json;
++        json["apiVersion"] = 3; json["online"] = true; json["deviceId"] = deviceId;
++        json["retentionDays"] = retentionDays; json["nextSequence"] = lastSequence + 1; json["simulation"] = false; json["busy"] = active(); json["clockSynced"] = clockValid;
++        String reason = notReady(); if (reason.isEmpty() && archiveCount() >= MAX_ARCHIVE_EVENTS) reason = "Historial lleno (512); espera retencion o ajusta dias."; json["ready"] = reason.isEmpty(); json["message"] = reason;
++        if (scaleHealthy()) json["remainingGrams"] = max(0.0f, hopperGrams); else json["remainingGrams"] = nullptr;
+         if (levelPercent >= 0) json["foodLevelPercent"] = levelPercent; else json["foodLevelPercent"] = nullptr;
+         if (isfinite(lastGain)) json["lastDispensedGrams"] = lastGain; else json["lastDispensedGrams"] = nullptr;
+         respond(200, json.as<JsonVariantConst>());
+     });
+     server.on("/api/events", HTTP_GET, [] {
+         if (!authorize()) return;
+-        DynamicJsonDocument response(24576); response["events"].set(eventsArray()); respond(200, response.as<JsonVariantConst>());
++        // No recorrer flash mientras el servo necesita lecturas frecuentes.
++        if (active()) {
++            DynamicJsonDocument response(24576); response["events"].set(eventsArray()); response["nextOffset"] = nullptr;
++            respond(200, response.as<JsonVariantConst>()); return;
++        }
++        int offset = server.arg("offset").toInt();
++        if (offset < 0 || offset > MAX_ARCHIVE_EVENTS) { reject(400, "Pagina invalida."); return; }
++        DynamicJsonDocument response(24576); JsonArray list = response.createNestedArray("events");
++        File root = LittleFS.open("/events"); int index = 0; bool more = false;
++        for (File f = root.openNextFile(); f; f = root.openNextFile()) {
++            if (index++ < offset) { f.close(); continue; }
++            if (list.size() == 32) { more = true; f.close(); break; }
++            StaticJsonDocument<1024> item;
++            if (deserializeJson(item, f)) { f.close(); reject(503, "Registro ilegible; revisar almacenamiento."); return; }
++            f.close(); list.add(item.as<JsonObject>());
++        }
++        if (more) response["nextOffset"] = offset + 32; else response["nextOffset"] = nullptr;
++        respond(200, response.as<JsonVariantConst>());
++    });
++    server.on("/api/preferences", HTTP_PUT, [] {
++        if (!authorize()) return;
++        if (active()) { reject(409, "Espera a que termine la porcion."); return; }
++        StaticJsonDocument<128> json; if (!parseBody(json)) return;
++        int days = json["retentionDays"] | 0;
++        if (days != 7 && days != 30) { reject(400, "Retencion: 7 o 30 dias."); return; }
++        if (prefs.putInt("retention", days) != sizeof(int)) { reject(503, "No se pudo guardar."); return; }
++        retentionDays = days; pruneArchive(); json["saved"] = true; respond(200, json.as<JsonVariantConst>());
+     });
+     server.on("/api/dispense", HTTP_POST, [] {
+         if (!authorize()) return;
+@@ -229,12 +308,17 @@
+             respond(200, previous); return;
+         }
+         String reason = notReady(); if (!reason.isEmpty()) { reject(409, reason); return; }
++        uint64_t sequence = json["sequence"] | uint64_t(0);
++        if (!petbite::sequenceAllowed(sequence, lastSequence)) { reject(409, "Secuencia antigua: actualiza estado antes de solicitar otra porcion."); return; }
++        // PETMIN SEGURIDAD: consumir secuencia antes de mover, incluso si falla después.
++        if (prefs.putULong64("sequence", sequence) != sizeof(uint64_t)) { reject(503, "Fallo de memoria."); return; }
++        lastSequence = sequence;
+         if (!beginMeal(id, json["grams"], "manual")) { reject(503, "No se pudo iniciar la porcion. Revisa peso y memoria."); return; }
+         respond(202, findEvent(id));
+     });
+     server.on("/api/stop", HTTP_POST, [] {
+         if (!authorize()) return;
+-        if (active()) finishMeal("failed", "Detenido desde la aplicacion.", HARDWARE_SIMULATION ? 0 : max(0.0f, bowlGrams - baseline));
++        if (active()) finishMeal("failed", "Detenido desde la aplicacion; peso final no estabilizado.", NAN);
+         else closeGate();
+         StaticJsonDocument<64> json; json["stopped"] = true; respond(200, json.as<JsonVariantConst>());
+     });
+@@ -274,7 +358,7 @@
+     Serial.begin(115200);
+     xTaskCreate(motorWatchdog, "petbite-guard", 2048, nullptr, 3, nullptr);
+     char chipId[18]; snprintf(chipId, sizeof(chipId), "%llX", static_cast<unsigned long long>(ESP.getEfuseMac())); deviceId = chipId;
+-    if (!HARDWARE_SIMULATION && ACTUATOR_CONFIGURED) {
++    if (ACTUATOR_CONFIGURED) {
+ #if ESP_ARDUINO_VERSION_MAJOR >= 3
+         servoReady = ledcAttach(SERVO_PIN, 50, 16);
+ #else
+@@ -283,8 +367,13 @@
+         closeGate();
+     }
+     scale.begin(HX711_DATA_PIN, HX711_CLOCK_PIN);
+-    pinMode(ULTRASONIC_TRIG_PIN, OUTPUT); pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+-    storageReady = prefs.begin("petbite", false);
++    pinMode(BUZZER_PIN, OUTPUT); digitalWrite(BUZZER_PIN, LOW);
++    storageReady = prefs.begin("petmin3", false);
++    lastSequence = prefs.getULong64("sequence", 0);
++    lastScheduleMinute = prefs.getULong64("lastMinute", 0);
++    retentionDays = prefs.getInt("retention", 30); if (retentionDays != 7) retentionDays = 30;
++    if (!LittleFS.begin(FORMAT_FS_ON_FAILURE)) { storageReady = false; Serial.println("LittleFS no disponible: consulta instalacion."); }
++    else if (!LittleFS.exists("/events") && !LittleFS.mkdir("/events")) storageReady = false;
+     if (deserializeJson(history, readHistory()) || !history.is<JsonArray>()) { history.to<JsonArray>(); storageReady = false; }
+     if (deserializeJson(timetable, prefs.getString("schedules", "[]")) || !timetable.is<JsonArray>()) { timetable.to<JsonArray>(); storageReady = false; }
+     for (JsonObject item : eventsArray()) {
+@@ -292,11 +381,24 @@
+         if (status == "accepted" || status == "dispensing") { item["status"] = "interrupted"; item["detail"] = "Reinicio durante la entrega. Revisa el recipiente; no se repetira automaticamente."; }
+         if (item["status"].as<String>() == "completed") lastGain = item["dispensedGrams"];
+     }
+-    persistHistory();
++    // Recuperar también archivos aceptados si el corte ocurrió antes de actualizar NVS.
++    if (storageReady) {
++        File root = LittleFS.open("/events");
++        for (File f = root.openNextFile(); f; f = root.openNextFile()) {
++            StaticJsonDocument<1024> item; bool ok = !deserializeJson(item, f); f.close();
++            if (!ok) { storageReady = false; break; }
++            String state = item["status"] | "";
++            if (state == "accepted" || state == "dispensing") {
++                item["status"] = "interrupted"; item["detail"] = "Reinicio: no repetir automaticamente; revisar recipiente.";
++                if (!archiveEvent(item.as<JsonObject>())) { storageReady = false; break; }
++            }
++        }
++    }
++    if (!persistHistory()) storageReady = false;
+     WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+     configTzTime("PET5", "pool.ntp.org", "time.google.com");
+     registerRoutes(); server.begin();
+-    Serial.println("PetBite v2 listo. Esperando Wi-Fi. Configura IP y clave en la app.");
++    Serial.println("PetMin v3 listo. Esperando Wi-Fi. Configura IP y clave en la app.");
+ }
+ void loop() {
+     // Sensores y cierre tienen prioridad sobre nuevas peticiones.
+@@ -304,6 +406,7 @@
+     clockValid = time(nullptr) > 1700000000;
+     server.handleClient();
+     serviceSchedules();
++    if (!active() && millis() - lastCleanupMs > 60000) { lastCleanupMs = millis(); pruneArchive(); }
+     if (millis() - lastWiFiMs >= 10000) {
+         lastWiFiMs = millis();
+         if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+--- a/firmware/PetBiteESP32/Rules.h
++++ b/firmware/PetBiteESP32/Rules.h
+@@ -4,9 +4,19 @@
+ inline bool validPortion(int grams) { return grams >= 5 && grams <= 300; }
+ inline bool validTime(int h, int m) { return h >= 0 && h < 24 && m >= 0 && m < 60; }
+ inline bool due(bool enabled, int h, int m, int nowH, int nowM, int lastDay, int day) {
+-    return enabled && validTime(h, m) && h == nowH && m == nowM && lastDay != day;
++    return enabled && validTime(h, m) && h == nowH && m == nowM && lastDay < day;
+ }
+ inline bool mustClose(float gain, int target, float margin, unsigned long elapsed, unsigned long maxTime) {
+     return !std::isfinite(gain) || gain < -5.0f || gain >= target - margin || elapsed >= maxTime;
+ }
+ }
++
++namespace petbite {
++// PETMIN NOTA: reglas puras compartidas por firmware y pruebas nativas.
++inline float hopperLoss(float before, float after) { return before - after; }
++inline bool sequenceAllowed(unsigned long long candidate, unsigned long long last) { return candidate > last && candidate > 0; }
++inline bool weightInRange(float weight, float capacity) { return std::isfinite(weight) && weight >= -10 && weight <= capacity; }
++inline bool withinTolerance(float measured, int requested, float tolerance) {
++    return std::isfinite(measured) && measured >= 0 && std::fabs(measured - requested) <= tolerance;
++}
++}
+--- /dev/null
++++ b/firmware/PetBiteESP32/Secrets.h.example
+@@ -0,0 +1,5 @@
++#pragma once
++// Copia como Secrets.h (ignorado por Git) y completa SOLO en tu equipo.
++constexpr char WIFI_SSID[] = "";
++constexpr char WIFI_PASSWORD[] = "";
++constexpr char API_TOKEN[] = "";
+--- a/firmware/tests/rules_test.cpp
++++ b/firmware/tests/rules_test.cpp
+@@ -3,6 +3,14 @@
+ #include <limits>
+ int main() {
+     using namespace petbite;
++    assert(hopperLoss(1000,960) == 40);
++    assert(hopperLoss(1000,1010) < 0);
++    assert(sequenceAllowed(2,1) && !sequenceAllowed(1,1) && !sequenceAllowed(0,0) && !sequenceAllowed(1,2));
++    assert(weightInRange(2000,2000) && !weightInRange(2001,2000));
++    assert(!weightInRange(std::numeric_limits<float>::quiet_NaN(),2000));
++    assert(withinTolerance(38,40,5) && !withinTolerance(46,40,5));
++    assert(!withinTolerance(std::numeric_limits<float>::quiet_NaN(),40,5));
++    assert(!due(true,8,0,8,0,20261010,20261009));
+     assert(validPortion(5) && validPortion(300) && !validPortion(301) && !validPortion(0));
+     assert(validTime(23,59) && !validTime(24,0));
+     assert(due(true,8,0,8,0,20261008,20261009));
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -12,5 +12,5 @@
+         mavenCentral()
+     }
+ }
+-rootProject.name = "PetBite"
++rootProject.name = "PetMin"
+ include(":app")
